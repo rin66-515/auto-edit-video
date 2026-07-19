@@ -1,0 +1,7 @@
+FROM python:3.11-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg cargo rustc build-essential pkg-config && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cpu && pip install --no-cache-dir deepfilternet==0.5.6
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+WORKDIR /worker
+COPY app ./app
+CMD ["python3", "-m", "app.audio_worker"]

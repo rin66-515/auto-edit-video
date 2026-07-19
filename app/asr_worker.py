@@ -1,0 +1,60 @@
+import gc
+import json
+import os
+import time
+from pathlib import Path
+import torch
+from qwen_asr import Qwen3ASRModel
+from . import db
+
+POLL=int(os.getenv("ASR_POLL_SECONDS","20"))
+ASR_MODEL=os.getenv("ASR_MODEL","Qwen/Qwen3-ASR-1.7B")
+ALIGNER_MODEL=os.getenv("ALIGNER_MODEL","Qwen/Qwen3-ForcedAligner-0.6B")
+
+def serial_time(item):
+    if isinstance(item,(str,int,float,bool,type(None))):return item
+    if isinstance(item,dict):return item
+    data={}
+    for key in ("text","start_time","end_time","start","end"):
+        if hasattr(item,key):data[key]=getattr(item,key)
+    return data or str(item)
+
+def srt_time(seconds):
+    ms=max(0,int(float(seconds)*1000));h,ms=divmod(ms,3600000);m,ms=divmod(ms,60000);s,ms=divmod(ms,1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def write_srt(asset_id,times):
+    target=Path("/vlog/_automation/projects")/"subtitles"/f"asset-{asset_id}.srt";target.parent.mkdir(parents=True,exist_ok=True)
+    lines=[]
+    for idx,t in enumerate(times,1):
+        if not isinstance(t,dict):continue
+        start=t.get("start_time",t.get("start"));end=t.get("end_time",t.get("end"));text=t.get("text","")
+        if start is None or end is None or not text:continue
+        lines.extend([str(idx),f"{srt_time(start)} --> {srt_time(end)}",str(text),""])
+    target.write_text("\n".join(lines),encoding="utf-8")
+    return str(target)
+
+def process(project):
+    db.execute("UPDATE projects SET status='transcribing',updated_at=?,error=NULL WHERE id=?",(db.now(),project['id']))
+    model=Qwen3ASRModel.from_pretrained(ASR_MODEL,dtype=torch.bfloat16,device_map="cuda:0",max_inference_batch_size=1,max_new_tokens=4096,forced_aligner=ALIGNER_MODEL,forced_aligner_kwargs={"dtype":torch.bfloat16,"device_map":"cuda:0"})
+    try:
+        for asset in db.rows("SELECT * FROM assets WHERE project_id=? ORDER BY id",(project['id'],)):
+            prior=json.loads(asset.get("analysis") or "{}")
+            if prior.get("transcript"):continue
+            result=model.transcribe(audio=asset['audio_path'],language=None,return_time_stamps=True)[0]
+            times=[serial_time(x) for x in (getattr(result,"time_stamps",None) or [])]
+            payload={**prior,"language":getattr(result,"language",None),"transcript":getattr(result,"text",""),"time_stamps":times,"asr_model":ASR_MODEL,"subtitle_path":write_srt(asset['id'],times)}
+            db.execute("UPDATE assets SET analysis=? WHERE id=?",(json.dumps(payload,ensure_ascii=False),asset['id']))
+        db.execute("UPDATE projects SET status='ready_for_visual',updated_at=? WHERE id=?",(db.now(),project['id']))
+    finally:
+        del model;gc.collect();torch.cuda.empty_cache()
+
+def main():
+    db.init_db()
+    while True:
+        project=db.row("SELECT * FROM projects WHERE status='ready_for_ai' ORDER BY id LIMIT 1")
+        if not project:time.sleep(POLL);continue
+        try:process(project)
+        except Exception as exc:
+            db.execute("UPDATE projects SET status='asr_failed',error=?,updated_at=? WHERE id=?",(str(exc),db.now(),project['id']));gc.collect();torch.cuda.empty_cache();time.sleep(POLL)
+if __name__=="__main__":main()

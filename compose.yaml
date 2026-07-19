@@ -1,0 +1,83 @@
+name: vlog-automation
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    gpus: all
+    ports:
+      - "127.0.0.1:${WEB_PORT:-4380}:4380"
+    environment:
+      VLOG_ROOT: /vlog
+      SCAN_SECONDS: ${SCAN_SECONDS:-30}
+      STABLE_SECONDS: ${STABLE_SECONDS:-300}
+      RAW_RETENTION_DAYS: ${RAW_RETENTION_DAYS:-14}
+      FINAL_RETENTION_DAYS: ${FINAL_RETENTION_DAYS:-90}
+      MIN_FREE_GIB: ${MIN_FREE_GIB:-80}
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      - ${VLOG_ROOT:-D:/vlog}:/vlog
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4380/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+  asr:
+    build:
+      context: .
+      dockerfile: Dockerfile.asr
+    restart: unless-stopped
+    gpus: all
+    environment:
+      VLOG_ROOT: /vlog
+      HF_HOME: /vlog/_automation/models/huggingface
+      HF_HUB_CACHE: /vlog/_automation/models/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      ASR_MODEL: Qwen/Qwen3-ASR-1.7B
+      ALIGNER_MODEL: Qwen/Qwen3-ForcedAligner-0.6B
+      ASR_POLL_SECONDS: 20
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      - ${VLOG_ROOT:-D:/vlog}:/vlog
+    depends_on:
+      app:
+        condition: service_healthy
+  audio:
+    build:
+      context: .
+      dockerfile: Dockerfile.audio
+    command: ["python3", "-m", "app.audio_worker"]
+    restart: unless-stopped
+    environment:
+      VLOG_ROOT: /vlog
+      AUDIO_POLL_SECONDS: 20
+      CUDA_VISIBLE_DEVICES: ""
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      - ${VLOG_ROOT:-D:/vlog}:/vlog
+    depends_on:
+      app:
+        condition: service_healthy
+  visual:
+    build:
+      context: .
+      dockerfile: Dockerfile.visual
+    command: ["python3", "-m", "app.visual_worker"]
+    restart: unless-stopped
+    gpus: all
+    environment:
+      VLOG_ROOT: /vlog
+      HF_HOME: /vlog/_automation/models/huggingface
+      HF_HUB_CACHE: /vlog/_automation/models/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      VL_MODEL: Qwen/Qwen3-VL-4B-Instruct
+      VL_POLL_SECONDS: 20
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      - ${VLOG_ROOT:-D:/vlog}:/vlog
+    depends_on:
+      app:
+        condition: service_healthy
+        
