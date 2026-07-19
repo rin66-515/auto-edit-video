@@ -49,6 +49,12 @@ def create_bilingual_captions(model,processor,analysis,duration):
     result=text_json(model,processor,prompt[:30000],3072)
     return result.get('captions',[]) if isinstance(result,dict) else []
 
+def queue_default_exports(project_id):
+    existing=len(db.rows("SELECT id FROM exports WHERE project_id=?",(project_id,)))
+    for offset,fmt in enumerate(("long_16x9","short_9x16"),1):
+        db.execute("INSERT INTO exports(project_id,version,format,status,created_at) VALUES(?,?,?,?,?)",(project_id,f"v{existing+offset}",fmt,"render_requested",db.now()))
+    db.execute("UPDATE projects SET status='render_requested',updated_at=? WHERE id=?",(db.now(),project_id))
+
 def process(project):
     db.execute("UPDATE projects SET status='visual_analyzing',updated_at=?,error=NULL WHERE id=?",(db.now(),project['id']))
     model,processor=load_model()
@@ -62,6 +68,7 @@ def process(project):
             db.execute("UPDATE assets SET analysis=? WHERE id=?",(json.dumps(prior,ensure_ascii=False),asset['id']))
         settings=json.loads(project.get('settings') or '{}');settings['story_plan']=create_story_plan(model,processor,project);settings['story_model']=MODEL_NAME
         db.execute("UPDATE projects SET status='draft_ready',settings=?,updated_at=? WHERE id=?",(json.dumps(settings,ensure_ascii=False),db.now(),project['id']))
+        queue_default_exports(project['id'])
     finally:
         del model,processor;gc.collect();torch.cuda.empty_cache()
 
@@ -74,6 +81,7 @@ def revise(project):
         settings['story_plan']=text_json(model,processor,prompt[:60000]);settings['story_model']=MODEL_NAME
         db.execute("UPDATE projects SET status='draft_ready',settings=?,updated_at=? WHERE id=?",(json.dumps(settings,ensure_ascii=False),db.now(),project['id']))
         db.execute("UPDATE revisions SET status='resolved',resolved_at=? WHERE project_id=? AND status='open'",(db.now(),project['id']))
+        queue_default_exports(project['id'])
     finally:
         del model,processor;gc.collect();torch.cuda.empty_cache()
 
