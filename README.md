@@ -22,3 +22,19 @@ docker compose up -d --build
 ```
 
 浏览器打开 `http://127.0.0.1:4380`。代码位于本目录；视频和模型只保存在 `D:\vlog\_automation`。系统不会扫描 `D:\vlog` 下已有的其他文件夹。
+
+## 按需启动和停止
+
+Vlog服务不会随Docker自动运行。需要使用时执行：
+
+```powershell
+& "D:\vlog\_automation\repository\scripts\start.ps1"
+```
+
+结束后执行：
+
+```powershell
+& "D:\vlog\_automation\repository\scripts\stop.ps1"
+```
+
+停止脚本只关闭Vlog服务，不影响其他Docker项目。

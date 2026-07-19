@@ -2,7 +2,7 @@ name: vlog-automation
 services:
   app:
     build: .
-    restart: unless-stopped
+    restart: "no"
     gpus: all
     ports:
       - "127.0.0.1:${WEB_PORT:-4380}:4380"
@@ -26,7 +26,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.asr
-    restart: unless-stopped
+    restart: "no"
     gpus: all
     environment:
       VLOG_ROOT: /vlog
@@ -48,7 +48,7 @@ services:
       context: .
       dockerfile: Dockerfile.audio
     command: ["python3", "-m", "app.audio_worker"]
-    restart: unless-stopped
+    restart: "no"
     environment:
       VLOG_ROOT: /vlog
       AUDIO_POLL_SECONDS: 20
@@ -64,7 +64,7 @@ services:
       context: .
       dockerfile: Dockerfile.visual
     command: ["python3", "-m", "app.visual_worker"]
-    restart: unless-stopped
+    restart: "no"
     gpus: all
     environment:
       VLOG_ROOT: /vlog
