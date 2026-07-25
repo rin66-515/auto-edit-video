@@ -16,6 +16,7 @@ services:
       TZ: ${TZ:-Asia/Tokyo}
     volumes:
       - ${VLOG_ROOT:-D:/vlog}:/vlog
+      - ./app:/app/app:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:4380/api/health"]
       interval: 30s
@@ -40,6 +41,7 @@ services:
       TZ: ${TZ:-Asia/Tokyo}
     volumes:
       - ${VLOG_ROOT:-D:/vlog}:/vlog
+      - ./app:/worker/app:ro
     depends_on:
       app:
         condition: service_healthy
@@ -56,6 +58,7 @@ services:
       TZ: ${TZ:-Asia/Tokyo}
     volumes:
       - ${VLOG_ROOT:-D:/vlog}:/vlog
+      - ./app:/worker/app:ro
     depends_on:
       app:
         condition: service_healthy
@@ -77,6 +80,7 @@ services:
       TZ: ${TZ:-Asia/Tokyo}
     volumes:
       - ${VLOG_ROOT:-D:/vlog}:/vlog
+      - ./app:/worker/app:ro
     depends_on:
       app:
         condition: service_healthy

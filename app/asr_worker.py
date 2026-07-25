@@ -2,6 +2,7 @@ import gc
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 import torch
 from qwen_asr import Qwen3ASRModel
@@ -35,26 +36,34 @@ def write_srt(asset_id,times):
     return str(target)
 
 def process(project):
-    db.execute("UPDATE projects SET status='transcribing',updated_at=?,error=NULL WHERE id=?",(db.now(),project['id']))
+    stage="语音转写"
+    if not db.begin_stage(project['id'],"transcribing","ready_for_ai",stage):return
     model=Qwen3ASRModel.from_pretrained(ASR_MODEL,dtype=torch.bfloat16,device_map="cuda:0",max_inference_batch_size=1,max_new_tokens=4096,forced_aligner=ALIGNER_MODEL,forced_aligner_kwargs={"dtype":torch.bfloat16,"device_map":"cuda:0"})
     try:
         for asset in db.rows("SELECT * FROM assets WHERE project_id=? ORDER BY id",(project['id'],)):
             prior=json.loads(asset.get("analysis") or "{}")
-            if prior.get("transcript"):continue
+            if "asr_model" in prior:
+                if not db.checkpoint(project['id'],"ready_for_ai",stage,asset['filename']):return
+                continue
+            if not db.checkpoint(project['id'],"ready_for_ai",stage,asset['filename']):return
             result=model.transcribe(audio=asset['audio_path'],language=None,return_time_stamps=True)[0]
             times=[serial_time(x) for x in (getattr(result,"time_stamps",None) or [])]
             payload={**prior,"language":getattr(result,"language",None),"transcript":getattr(result,"text",""),"time_stamps":times,"asr_model":ASR_MODEL,"subtitle_path":write_srt(asset['id'],times)}
             db.execute("UPDATE assets SET analysis=? WHERE id=?",(json.dumps(payload,ensure_ascii=False),asset['id']))
-        db.execute("UPDATE projects SET status='ready_for_visual',updated_at=? WHERE id=?",(db.now(),project['id']))
+            db.log_event(project['id'],"info",stage,"asset_completed",f"转写已完成：{asset['filename']}",{"asset_id":asset['id'],"language":payload.get('language')})
+            if not db.checkpoint(project['id'],"ready_for_ai",stage,asset['filename']):return
+        db.finish_stage(project['id'],"ready_for_visual",stage,"全部语音转写完成")
     finally:
         del model;gc.collect();torch.cuda.empty_cache()
 
 def main():
     db.init_db()
+    db.recover_interrupted_projects("asr")
+    db.start_worker_heartbeat("asr","语音识别")
     while True:
-        project=db.row("SELECT * FROM projects WHERE status='ready_for_ai' ORDER BY id LIMIT 1")
+        project=db.row("SELECT p.* FROM projects p JOIN project_control c ON c.project_id=p.id WHERE c.desired_state='running' AND p.status='ready_for_ai' ORDER BY p.id LIMIT 1")
         if not project:time.sleep(POLL);continue
         try:process(project)
         except Exception as exc:
-            db.execute("UPDATE projects SET status='asr_failed',error=?,updated_at=? WHERE id=?",(str(exc),db.now(),project['id']));gc.collect();torch.cuda.empty_cache();time.sleep(POLL)
+            db.fail_stage(project['id'],"asr_failed","ready_for_ai","语音转写",str(exc),traceback.format_exc());gc.collect();torch.cuda.empty_cache();time.sleep(POLL)
 if __name__=="__main__":main()
