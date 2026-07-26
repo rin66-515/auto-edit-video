@@ -1,21 +1,22 @@
 import json
-import os
-import shutil
-import tempfile
 import unittest
-from pathlib import Path
 
-
-TEST_ROOT = Path(tempfile.mkdtemp(prefix="vlog-retention-test-"))
-os.environ["VLOG_ROOT"] = str(TEST_ROOT)
 
 from app import db, main, pipeline
+from _support import IsolatedDbTestCase
 
 
-class RetentionWorkflowTest(unittest.TestCase):
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(TEST_ROOT, ignore_errors=True)
+class RetentionWorkflowTest(IsolatedDbTestCase):
+    def setUp(self):
+        super().setUp()
+        names=("INBOX","PROXIES","AUDIO","PROJECTS","OUTPUTS")
+        self._original_paths={name:getattr(pipeline,name) for name in names}
+        self.addCleanup(self._restore_paths)
+        folders={"INBOX":"inbox","PROXIES":"proxies","AUDIO":"audio","PROJECTS":"projects","OUTPUTS":"outputs"}
+        for name,folder in folders.items():setattr(pipeline,name,self.test_root/folder)
+
+    def _restore_paths(self):
+        for name,path in self._original_paths.items():setattr(pipeline,name,path)
 
     def test_upload_toggle_and_retention_cleanup(self):
         db.init_db()

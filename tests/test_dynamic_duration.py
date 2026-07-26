@@ -3,11 +3,22 @@ import unittest
 from unittest.mock import patch
 
 from app import db,main,render_plan
+from _support import IsolatedDbTestCase
 
 
-class DynamicDurationTest(unittest.TestCase):
+class DynamicDurationTest(IsolatedDbTestCase):
+    def setUp(self):
+        super().setUp()
+        self._original_music=render_plan.MUSIC
+        self.addCleanup(self._restore_music)
+        render_plan.MUSIC=self.test_root/"music"
+        render_plan.MUSIC.mkdir(parents=True,exist_ok=True)
+
+    def _restore_music(self):
+        render_plan.MUSIC=self._original_music
+
     def test_short_snapshot_follows_selected_bgm_duration_and_keeps_one_output(self):
-        db.init_db();stamp=db.now();slug=f"dynamic-short-{id(self)}"
+        stamp=db.now();slug=f"dynamic-short-{id(self)}"
         project_id=db.execute(
             "INSERT INTO projects(slug,title,source_dir,status,settings,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             (slug,"Dynamic Short",f"/vlog/inbox/{slug}","draft_ready","{}",stamp,stamp),

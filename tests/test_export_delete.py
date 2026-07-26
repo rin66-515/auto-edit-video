@@ -1,24 +1,27 @@
 import json
-import shutil
 import unittest
 
 from fastapi import HTTPException
 from app import db,main
-from app.config import OUTPUTS
+from _support import IsolatedDbTestCase
 
 
-class ExportDeleteTest(unittest.TestCase):
+class ExportDeleteTest(IsolatedDbTestCase):
     def setUp(self):
-        db.init_db();stamp=db.now();self.slug=f"delete-export-{id(self)}-{stamp.replace(':','-')}"
+        super().setUp()
+        self._original_outputs=main.OUTPUTS
+        self.addCleanup(self._restore_outputs)
+        main.OUTPUTS=self.test_root/"outputs"
+        stamp=db.now();self.slug=f"delete-export-{id(self)}-{stamp.replace(':','-')}"
         self.project_id=db.execute("INSERT INTO projects(slug,title,source_dir,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",(self.slug,"Delete Export Test",f"/tmp/{self.slug}","review_ready",stamp,stamp))
         db.create_control(self.project_id,"running",None,"人工审核")
-        self.output_dir=OUTPUTS/self.slug/"v9";self.output_dir.mkdir(parents=True,exist_ok=True)
+        self.output_dir=main.OUTPUTS/self.slug/"v9";self.output_dir.mkdir(parents=True,exist_ok=True)
         self.video=self.output_dir/"long.mp4";self.subtitle=self.output_dir/"long.zh-ja.srt"
         self.video.write_bytes(b"video");self.subtitle.write_text("subtitle",encoding="utf-8")
         self.export_id=db.execute("INSERT INTO exports(project_id,version,format,path,status,created_at) VALUES(?,?,?,?,?,?)",(self.project_id,"v9","long_16x9",json.dumps([str(self.video)]),"review_ready",stamp))
 
-    def tearDown(self):
-        shutil.rmtree(OUTPUTS/self.slug,ignore_errors=True)
+    def _restore_outputs(self):
+        main.OUTPUTS=self._original_outputs
 
     def test_requires_stopped_confirmation_state_then_deletes_only_version_files(self):
         with self.assertRaises(HTTPException) as blocked:

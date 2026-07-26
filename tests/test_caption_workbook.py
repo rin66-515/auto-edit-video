@@ -10,11 +10,12 @@ from openpyxl import load_workbook
 from app import db
 from app.main import CaptionWorkbookImportIn,export_caption_summary,export_version_caption_xlsx,import_version_caption_workbook
 from app.media import _write_bilingual_srt
+from _support import IsolatedDbTestCase
 
 
-class CaptionWorkbookWorkflowTest(unittest.TestCase):
+class CaptionWorkbookWorkflowTest(IsolatedDbTestCase):
     def setUp(self):
-        db.init_db();stamp=db.now();self.slug=f"workbook-test-{id(self)}"
+        super().setUp();stamp=db.now();self.slug=f"workbook-test-{id(self)}"
         self.project_id=db.execute("INSERT INTO projects(slug,title,source_dir,status,mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(self.slug,"Workbook Test",f"/vlog/inbox/{self.slug}","visual_failed","existing",stamp,stamp))
         db.create_control(self.project_id,"stopped","ready_for_visual","字幕人工复核")
         analysis={"caption_version":3,"bilingual_captions":[{"start":1.25,"end":2.75,"source":"こんにちは","zh":"你好","ja":"こんにちは","confidence":0.7,"needs_review":True}]}
