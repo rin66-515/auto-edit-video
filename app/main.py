@@ -14,11 +14,11 @@ from pydantic import BaseModel,Field
 from . import db
 from .caption_clean import format_timecode,is_standalone_filler
 from .caption_workbook import build_caption_workbook,read_caption_workbook
-from .config import INBOX,PROXIES,OUTPUTS,PROJECTS,MUSIC,MIN_FREE_GIB,VIDEO_EXTENSIONS
-from .media import analyze_music_rhythm,probe
+from .config import INBOX,PROXIES,OUTPUTS,PROJECTS,MIN_FREE_GIB,VIDEO_EXTENSIONS
 from .pipeline import start_background,scan_once,cleanup_project_temp
+from .render_plan import RenderPlanError,requested_snapshot
+from .revision_intent import parse_revision_intent
 from .short_revision import release_scheduled_short
-from .story_planner import rebuild_short_plans
 
 PLATFORMS=("youtube","bilibili","douyin","xiaohongshu")
 @asynccontextmanager
@@ -51,10 +51,21 @@ def scan():
     scan_once();return {"ok":True}
 @app.get("/api/projects")
 def projects():return db.project_summaries()
+def _revision_source_clip_count(export):
+    if not export or export.get("format")!="short_9x16":return None
+    try:snapshot=json.loads(export.get("timeline_snapshot") or "{}")
+    except json.JSONDecodeError:return None
+    timeline=snapshot.get("short-1") if isinstance(snapshot,dict) else None
+    return len(timeline) if isinstance(timeline,list) and timeline else None
+
 @app.get("/api/projects/{project_id}")
 def project(project_id:int):
     item=db.project_detail(project_id)
     if not item:raise HTTPException(404,"项目不存在")
+    exports={int(value["id"]):value for value in item.get("exports") or []}
+    for revision in item.get("revisions") or []:
+        source=exports.get(int(revision.get("source_export_id") or 0))
+        revision["parsed_intent"]=parse_revision_intent([revision],_revision_source_clip_count(source))
     return item
 
 @app.get("/api/projects/{project_id}/live")
@@ -75,26 +86,11 @@ def _timeline_snapshot(export,settings=None):
     if export["format"]=="long_16x9":return {"long":plan.get("long",{}).get("timeline",[])}
     return {f"short-{index+1}":value.get("timeline",[]) for index,value in enumerate((plan.get("shorts") or [])[:1]) if isinstance(value,dict)}
 
-def _requested_snapshot(project_id,version,fmt,settings):
-    plan=settings.get("story_plan") or {}
-    if fmt=="long_16x9":return {"long":plan.get("long",{}).get("timeline",[])},{}
-    shorts=[value for value in (plan.get("shorts") or [])[:1] if isinstance(value,dict)]
-    if not shorts:raise HTTPException(409,"剪辑方案没有可用的短篇主题")
-    short_bgm=settings.get("short_bgm") if isinstance(settings.get("short_bgm"),dict) else {}
-    requested=str(short_bgm.get("filename") or "").strip()
-    if not requested:return {"short-1":shorts[0].get("timeline",[])},{}
-    if Path(requested).name!=requested:raise HTTPException(400,"BGM 只填写音乐库中的文件名，不要填写路径")
-    music=(MUSIC/requested).resolve()
-    if not music.is_relative_to(MUSIC.resolve()) or not music.is_file():raise HTTPException(409,f"没有找到指定 BGM：{requested}")
-    if music.suffix.lower() not in {".mp3",".wav",".m4a",".aac",".flac"}:raise HTTPException(400,"BGM 格式仅支持 mp3、wav、m4a、aac、flac")
-    try:duration=float(probe(music).get("duration") or 0)
-    except Exception as exc:raise HTTPException(409,f"无法读取 BGM：{exc}")
-    if not 10<=duration<=600:raise HTTPException(409,f"BGM 时长须为10秒到10分钟，当前 {duration:.1f} 秒")
-    assets=db.rows("SELECT * FROM assets WHERE project_id=? ORDER BY id",(project_id,))
-    rhythm_marks=analyze_music_rhythm(music,duration)
-    rebuilt=rebuild_short_plans(shorts,plan.get("long",{}).get("timeline",[]),assets,f"{plan.get('short_style_seed')}:{project_id}:{version}",target_seconds=duration,max_outputs=1,bgm_led=True,rhythm_marks=rhythm_marks)
-    short=rebuilt[0]
-    return {"short-1":short["timeline"]},{"bgm_filename":requested,"bgm_duration":round(duration,3),"short_style_profile":short.get("style_profile"),"short_voice_mode":short.get("voice_mode"),"short_voice_reason":short.get("voice_reason"),"short_voice_clips":short.get("voice_clips") or [],"short_flash_bursts":short.get("flash_bursts") or [],"caption_policy":short.get("caption_policy")}
+def _requested_snapshot(project_id,version,fmt,settings,fallback_snapshot=None):
+    try:
+        return requested_snapshot(project_id,version,fmt,settings,fallback_snapshot)
+    except RenderPlanError as exc:
+        raise HTTPException(exc.status_code,str(exc)) from exc
 
 def _caption_override_key(output_name,timeline_index,asset_id,caption_index):
     return f"{output_name}|{timeline_index}|{asset_id}|{caption_index}"
@@ -432,8 +428,18 @@ def delete_export(export_id:int):
     return {"ok":True,"deleted_files":len(deleted),"released_bytes":released}
 @app.put("/api/projects/{project_id}")
 def update_project(project_id:int,body:SettingsIn):
-    if not db.row("SELECT id FROM projects WHERE id=?",(project_id,)):raise HTTPException(404,"项目不存在")
-    db.execute("UPDATE projects SET mode=?,notes=?,settings=?,updated_at=? WHERE id=?",(body.mode,body.notes,json.dumps(body.settings,ensure_ascii=False),db.now(),project_id));db.log_event(project_id,"info","项目设置","settings_updated","制作设定已保存");return db.project_detail(project_id)
+    project=db.row("SELECT settings FROM projects WHERE id=?",(project_id,))
+    if not project:raise HTTPException(404,"项目不存在")
+    try:current=json.loads(project.get("settings") or "{}")
+    except json.JSONDecodeError:current={}
+    incoming=body.settings if isinstance(body.settings,dict) else {}
+    protected={"story_plan","story_model","replan_request"}
+    merged=dict(current)
+    merged.update({key:value for key,value in incoming.items() if key not in protected})
+    preserved=sorted(key for key in protected if key in incoming and incoming.get(key)!=current.get(key))
+    db.execute("UPDATE projects SET mode=?,notes=?,settings=?,updated_at=? WHERE id=?",(body.mode,body.notes,json.dumps(merged,ensure_ascii=False),db.now(),project_id))
+    db.log_event(project_id,"info","项目设置","settings_updated","制作设定已保存",{"preserved_internal_keys":preserved})
+    return db.project_detail(project_id)
 
 @app.post("/api/projects/{project_id}/control/{action}")
 def control_project(project_id:int,action:str):
@@ -448,6 +454,17 @@ def control_project(project_id:int,action:str):
         expected="stopped" if action=="start" else "paused"
         if desired!=expected:raise HTTPException(409,f"项目当前状态不能{('启动' if action=='start' else '继续')}")
         if not resume:raise HTTPException(409,"当前没有可执行的后续阶段")
+        if resume=="revision_requested":
+            try:settings=json.loads(project.get("settings") or "{}")
+            except json.JSONDecodeError:settings={}
+            request=settings.get("replan_request") if isinstance(settings.get("replan_request"),dict) else None
+            project_revision=db.row("SELECT id FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NULL LIMIT 1",(project_id,))
+            if not request and not project_revision:
+                version_revisions=db.rows("SELECT DISTINCT source_version FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NOT NULL ORDER BY source_version",(project_id,))
+                if version_revisions:
+                    labels="、".join(str(value.get("source_version") or "该版本") for value in version_revisions)
+                    db.log_event(project_id,"warning","修改剪辑方案","version_replan_not_requested",f"仅存在版本级意见：{labels}；已阻止误启动项目级重规划",{"versions":[value.get("source_version") for value in version_revisions]})
+                    raise HTTPException(409,f"当前只有 {labels} 的版本级意见。请在该版本点击“废弃并重规划”后再启动；不会直接执行项目级重规划")
         required_worker=db.required_worker_for_status(resume)
         if required_worker and not db.worker_online(required_worker):
             label=db.WORKERS[required_worker]
@@ -462,7 +479,10 @@ def control_project(project_id:int,action:str):
                 failed=db.row("SELECT id FROM exports WHERE project_id=? AND status='render_failed' ORDER BY id DESC LIMIT 1",(project_id,))
                 if failed:db.execute("UPDATE exports SET status='render_requested' WHERE id=?",(failed["id"],))
                 else:raise HTTPException(409,"没有可继续的渲染任务")
-        next_scope=current.get("render_scope") if action=="continue" else None
+        # A version-bound replan finishes in the stopped state with the intended
+        # format stored as its scope.  Preserve that scope for both Start and
+        # Continue so an older pending export cannot run before the rebuilt one.
+        next_scope=current.get("render_scope")
         db.create_control(project_id,"running",resume,db.stage_for(resume),None,render_scope=next_scope)
         db.execute("UPDATE projects SET status=?,error=NULL,updated_at=? WHERE id=?",(resume,db.now(),project_id))
         verb="启动" if action=="start" else "继续"
@@ -486,6 +506,15 @@ def control_project(project_id:int,action:str):
             db.log_event(project_id,"warning",stage,final,f"项目已在 {stage} 安全{verb}",{"item":current.get("item")})
     else:raise HTTPException(400,"未知控制操作")
     return db.project_detail(project_id)
+@app.post("/api/projects/{project_id}/revisions/preview")
+def preview_revision(project_id:int,body:RevisionIn):
+    if not db.row("SELECT id FROM projects WHERE id=?",(project_id,)):raise HTTPException(404,"项目不存在")
+    source=None
+    if body.source_export_id is not None:
+        source=db.row("SELECT id,format,timeline_snapshot FROM exports WHERE id=? AND project_id=?",(body.source_export_id,project_id))
+        if not source:raise HTTPException(404,"关联版本不存在或不属于当前项目")
+    return parse_revision_intent([{"kind":body.kind,"body":body.body}],_revision_source_clip_count(source))
+
 @app.post("/api/projects/{project_id}/revisions")
 def add_revision(project_id:int,body:RevisionIn):
     project=db.row("SELECT id FROM projects WHERE id=?",(project_id,))
@@ -501,11 +530,18 @@ def add_revision(project_id:int,body:RevisionIn):
         (project_id,body.kind,body.body,source["id"] if source else None,source["version"] if source else None,stamp),
     )
     label=f"{source['version']} 的版本意见" if source else "项目级意见"
+    if source:
+        # Version-scoped feedback is only consumed after the user explicitly
+        # discards that version's master and requests a version replan.  It
+        # must never start the project-level replan worker by itself.
+        db.log_event(project_id,"info","人工审核","revision_added",f"收到{body.kind}{label}；请在 {source['version']} 点击“废弃并重规划”后应用",{"revision_id":rid,"body":body.body,"source_export_id":source["id"],"source_version":source["version"]})
+        parsed=parse_revision_intent([{"kind":body.kind,"body":body.body}],_revision_source_clip_count(db.row("SELECT format,timeline_snapshot FROM exports WHERE id=?",(source["id"],))))
+        return {"id":rid,"ok":True,"source_export_id":source["id"],"source_version":source["version"],"waiting_for":"discard_and_replan","parsed_intent":parsed}
     db.execute("UPDATE projects SET status='revision_requested',updated_at=? WHERE id=?",(stamp,project_id))
     db.create_control(project_id,"stopped","revision_requested","修改剪辑方案",f"{label}已记录，等待启动",render_scope=None)
     db.set_progress(project_id,"revision_requested","修改剪辑方案",label)
-    db.log_event(project_id,"info","人工审核","revision_added",f"收到{body.kind}{label}",{"revision_id":rid,"body":body.body,"source_export_id":source["id"] if source else None,"source_version":source["version"] if source else None})
-    return {"id":rid,"ok":True,"source_export_id":source["id"] if source else None,"source_version":source["version"] if source else None}
+    db.log_event(project_id,"info","人工审核","revision_added",f"收到{body.kind}{label}",{"revision_id":rid,"body":body.body,"source_export_id":None,"source_version":None})
+    return {"id":rid,"ok":True,"source_export_id":None,"source_version":None,"parsed_intent":parse_revision_intent([{"kind":body.kind,"body":body.body}],None)}
 
 @app.delete("/api/projects/{project_id}/revisions/{revision_id}")
 def delete_revision(project_id:int,revision_id:int):
@@ -522,9 +558,9 @@ def delete_revision(project_id:int,revision_id:int):
     if revision["status"]=="open" and revision_id in locked_ids:
         raise HTTPException(409,"这条意见已锁定到等待执行的版本重规划；请先完成或取消该重规划")
     db.execute("DELETE FROM revisions WHERE id=?",(revision_id,))
-    remaining_open=db.row("SELECT id FROM revisions WHERE project_id=? AND status='open' LIMIT 1",(project_id,))
-    if revision["status"]=="open" and not remaining_open and project["status"]=="revision_requested":
-        stamp=db.now();db.execute("UPDATE projects SET status='draft_ready',updated_at=? WHERE id=?",(stamp,project_id));db.create_control(project_id,"stopped",None,"等待选择版本","已删除最后一条待应用意见")
+    remaining_project_open=db.row("SELECT id FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NULL LIMIT 1",(project_id,))
+    if revision["status"]=="open" and revision.get("source_export_id") is None and not remaining_project_open and project["status"]=="revision_requested":
+        stamp=db.now();db.execute("UPDATE projects SET status='draft_ready',updated_at=? WHERE id=?",(stamp,project_id));db.create_control(project_id,"stopped",None,"等待选择版本","已删除最后一条待应用的项目级意见")
     db.log_event(project_id,"warning","剪辑方案重规划","revision_deleted",f"已删除规划意见 #{revision_id}",{"revision_id":revision_id,"status":revision["status"],"source_version":revision.get("source_version"),"applied_version":revision.get("applied_version")})
     return {"ok":True,"id":revision_id,"status":revision["status"]}
 
@@ -551,9 +587,22 @@ def generate_export(project_id:int,fmt:str):
     if control.get("desired_state") not in {"stopped","paused"}:raise HTTPException(409,"项目正在运行，不能同时启动另一个版本")
     free_gib=shutil.disk_usage(INBOX).free/1024**3
     if free_gib<MIN_FREE_GIB:raise HTTPException(507,f"D盘空间不足：{free_gib:.1f} GiB；至少需要 {MIN_FREE_GIB} GiB")
+    settings=json.loads(project.get("settings") or "{}")
+    replan_request=settings.get("replan_request") if isinstance(settings.get("replan_request"),dict) else None
+    if replan_request:
+        source_version=str(replan_request.get("source_version") or "该版本")
+        db.log_event(project_id,"warning","修改剪辑方案","replan_render_blocked",f"{source_version} 正在等待版本重规划，已阻止直接请求成片",{"format":fmt,"source_export_id":replan_request.get("source_export_id")})
+        raise HTTPException(409,f"{source_version} 已废弃并等待重规划；请先点击“启动项目”完成方案重建，再渲染新版本")
+    if fmt=="both":
+        continuable_statuses=("render_requested","rendering","render_failed","subtitle_render_requested","subtitle_rendering","subtitle_render_failed","scheduled")
+        placeholders=",".join("?" for _ in continuable_statuses)
+        continuable=db.rows(f"SELECT version,format,status FROM exports WHERE project_id=? AND status IN ({placeholders}) ORDER BY id",(project_id,*continuable_statuses))
+        if continuable:
+            labels="、".join(f"{value['version']} · {'长篇' if value['format']=='long_16x9' else '短篇'}" for value in continuable)
+            db.log_event(project_id,"warning","成片渲染","combined_render_blocked",f"存在待继续任务，已阻止长短篇一起渲染：{labels}",{"format":fmt,"continuable_exports":continuable})
+            raise HTTPException(409,f"已有待继续的渲染任务：{labels}。请单独继续、单独渲染，或先删除/废弃该任务后再选择长短篇一起渲染")
     formats=("long_16x9","short_9x16") if fmt=="both" else (fmt,)
     pending_by_format={value:db.row("SELECT id,version,status,render_options FROM exports WHERE project_id=? AND format=? AND status IN ('render_requested','render_failed') ORDER BY id LIMIT 1",(project_id,value)) for value in formats}
-    settings=json.loads(project.get("settings") or "{}")
     pending_short=pending_by_format.get("short_9x16")
     short_bgm=settings.get("short_bgm") if isinstance(settings.get("short_bgm"),dict) else {}
     requested_bgm=str(short_bgm.get("filename") or "").strip()
@@ -562,9 +611,15 @@ def generate_export(project_id:int,fmt:str):
         except json.JSONDecodeError:existing_options={}
         existing_bgm=str(existing_options.get("bgm_filename") or "").strip()
         if requested_bgm!=existing_bgm:
-            snapshot,bgm_options=_requested_snapshot(project_id,pending_short["version"],"short_9x16",settings)
-            for key in ("bgm_filename","bgm_duration","short_style_profile"):existing_options.pop(key,None)
+            try:
+                fallback_snapshot=json.loads(db.row("SELECT timeline_snapshot FROM exports WHERE id=?",(pending_short["id"],)).get("timeline_snapshot") or "{}")
+            except (AttributeError,TypeError,json.JSONDecodeError):
+                fallback_snapshot={}
+            snapshot,bgm_options=_requested_snapshot(project_id,pending_short["version"],"short_9x16",settings,fallback_snapshot)
+            for key in ("bgm_filename","bgm_duration","short_style_profile","short_voice_mode","short_voice_reason","short_voice_clips","short_flash_bursts","caption_policy","snapshot_fallback"):existing_options.pop(key,None)
             existing_options.update(bgm_options)
+            if bgm_options.get("snapshot_fallback"):
+                db.log_event(project_id,"warning","成片渲染","story_plan_snapshot_fallback",f"{pending_short['version']} 未找到当前剪辑方案主题，已安全复用该版本已有短篇时间线；不会丢失待渲染任务",{"export_id":pending_short["id"],"version":pending_short["version"]})
             db.execute("UPDATE exports SET timeline_snapshot=?,render_options=? WHERE id=?",(json.dumps(snapshot,ensure_ascii=False),json.dumps(existing_options,ensure_ascii=False),pending_short["id"]))
             db.log_event(project_id,"info","成片渲染","pending_short_bgm_updated",f"{pending_short['version']} 已在启动前匹配短篇 BGM：{requested_bgm or '无 BGM'}",{"export_id":pending_short["id"],"bgm_filename":requested_bgm or None,"render_options":bgm_options})
     missing=[value for value in formats if not pending_by_format[value]]

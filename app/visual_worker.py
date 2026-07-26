@@ -12,7 +12,9 @@ from PIL import Image
 import torch
 from transformers import AutoModelForImageTextToText,AutoProcessor,BitsAndBytesConfig
 from . import db
-from .story_planner import assemble_story_plan,story_plan_errors,valid_story_plan
+from .config import MUSIC
+from .media import analyze_music_rhythm,probe
+from .story_planner import assemble_story_plan,manual_short_reselection,story_plan_errors,valid_story_plan
 
 POLL=int(os.getenv("VL_POLL_SECONDS","20"))
 MODEL_NAME=os.getenv("VL_MODEL","Qwen/Qwen3-VL-4B-Instruct")
@@ -249,6 +251,28 @@ def _next_version(project_id):
 def _finalize_version_bound_replan(project,settings,source,revisions):
     snapshot=_plan_snapshot(settings.get("story_plan") or {},source["format"]);version=_next_version(project["id"]);revision_ids=[int(value["id"]) for value in revisions]
     options={"plan_rebuild":{"source_export_id":source["id"],"source_version":source["version"],"revision_ids":revision_ids}}
+    # Carry the source version's render choices into the rebuilt version.  In
+    # particular, a short version must keep its selected BGM when the user
+    # starts the newly planned version directly from the control panel.
+    try:
+        source_options=json.loads(source.get("render_options") or "{}")
+    except (AttributeError,TypeError,json.JSONDecodeError):
+        source_options={}
+    for key in ("bgm_filename","bgm_duration","short_style_profile","short_voice_mode","short_voice_reason","short_voice_clips","short_flash_bursts","caption_policy"):
+        if source_options.get(key) is not None:
+            options[key]=source_options[key]
+    planned_short=((settings.get("story_plan") or {}).get("shorts") or [None])[0]
+    manual_replan=planned_short.get("manual_replan") if isinstance(planned_short,dict) else None
+    if isinstance(manual_replan,dict):
+        options["manual_replan"]=manual_replan
+        options["short_style_profile"]=planned_short.get("style_profile") or options.get("short_style_profile")
+        options["short_voice_mode"]=planned_short.get("voice_mode") or "bgm_only"
+        options["short_voice_reason"]=planned_short.get("voice_reason") or "人工指定 BGM 主导"
+        options["short_voice_clips"]=planned_short.get("voice_clips") or []
+        options["short_flash_bursts"]=planned_short.get("flash_bursts") or []
+        options["caption_policy"]="none"
+        if manual_replan.get("bgm_filename"):options["bgm_filename"]=manual_replan["bgm_filename"]
+        if manual_replan.get("bgm_duration") is not None:options["bgm_duration"]=manual_replan["bgm_duration"]
     export_id=db.execute(
         "INSERT INTO exports(project_id,version,format,status,timeline_snapshot,render_options,source_export_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
         (project["id"],version,source["format"],"render_requested",json.dumps(snapshot,ensure_ascii=False),json.dumps(options,ensure_ascii=False),source["id"],db.now()),
@@ -263,16 +287,39 @@ def _finalize_version_bound_replan(project,settings,source,revisions):
     db.log_event(project["id"],"success","修改剪辑方案","version_replan_completed",f"已读取 {source['version']} 的 {len(revision_ids)} 条意见并创建 {version}；请确认方案后启动渲染",{"source_export_id":source["id"],"source_version":source["version"],"new_export_id":export_id,"new_version":version,"revision_ids":revision_ids,"format":source["format"]})
     return {"export_id":export_id,"version":version,"revision_ids":revision_ids}
 
+def _manual_short_for_revisions(revisions,assets,settings,project_id,source_version=None,base_timeline=None):
+    """Return a hard-constrained BGM short when feedback names raw sources."""
+    short_bgm=settings.get("short_bgm") if isinstance(settings.get("short_bgm"),dict) else {}
+    requested=str(short_bgm.get("filename") or "").strip();duration=None;rhythm_marks=[]
+    if requested:
+        music=(MUSIC/requested).resolve()
+        if not music.is_relative_to(MUSIC.resolve()) or not music.is_file():
+            raise RuntimeError(f"人工指定短篇找不到 BGM：{requested}")
+        duration=float(probe(music).get("duration") or 0)
+        if not 10<=duration<=600:raise RuntimeError(f"人工指定短篇 BGM 时长无效：{duration:.1f} 秒")
+        rhythm_marks=analyze_music_rhythm(music,duration)
+    short=manual_short_reselection(revisions,assets,f"manual:{project_id}:{source_version or 'project'}",duration,rhythm_marks,base_timeline)
+    if short is None:return None
+    manual=short.get("manual_replan") if isinstance(short.get("manual_replan"),dict) else {}
+    manual["bgm_filename"]=requested or None;manual["bgm_duration"]=round(duration,3) if duration is not None else None
+    short["manual_replan"]=manual
+    return short
+
+
 def revise(project):
     stage="修改剪辑方案"
     if not db.begin_stage(project['id'],"revision_planning","revision_requested",stage):return
-    model,processor=load_model()
+    model=processor=None
+    def get_model():
+        nonlocal model,processor
+        if model is None:model,processor=load_model()
+        return model,processor
     try:
         settings=json.loads(project.get('settings') or '{}');request=settings.get("replan_request") if isinstance(settings.get("replan_request"),dict) else None;source=None
         if request:
             try:source_id=int(request.get("source_export_id"))
             except (TypeError,ValueError):raise RuntimeError("版本重规划请求缺少来源版本")
-            source=db.row("SELECT id,version,format,status FROM exports WHERE id=? AND project_id=?",(source_id,project['id']))
+            source=db.row("SELECT id,version,format,status,render_options,timeline_snapshot FROM exports WHERE id=? AND project_id=?",(source_id,project['id']))
             if not source or source["status"]!="replan_requested":raise RuntimeError("关联版本不再处于等待重规划状态")
             revision_ids=[int(value) for value in request.get("revision_ids") or [] if str(value).isdigit()]
             if not revision_ids:raise RuntimeError("版本重规划没有绑定意见")
@@ -287,13 +334,28 @@ def revise(project):
             analysis=json.loads(asset.get("analysis") or "{}")
             if int(analysis.get("caption_version") or 0)<3:
                 if not db.checkpoint(project['id'],"revision_requested","字幕二次精校",asset['filename']):return
-                analysis["bilingual_captions"]=create_bilingual_captions(model,processor,analysis,asset.get('duration') or 0);analysis["caption_version"]=3
+                caption_model,caption_processor=get_model()
+                analysis["bilingual_captions"]=create_bilingual_captions(caption_model,caption_processor,analysis,asset.get('duration') or 0);analysis["caption_version"]=3
                 db.execute("UPDATE assets SET analysis=? WHERE id=?",(json.dumps(analysis,ensure_ascii=False),asset['id']))
                 db.log_event(project['id'],"info","字幕二次精校","caption_proofread",f"中日字幕已二次精校：{asset['filename']}",{"asset_id":asset['id']})
             catalog.append({"asset_id":asset["id"],"filename":asset["filename"],"duration":asset["duration"],"transcript":analysis.get("transcript","")[:1200],"visual":analysis.get("visual",{})})
         scope=f"本轮仅应用来源版本 {source['version']} 的绑定意见。" if source else "本轮仅应用未关联版本的项目级意见。"
-        prompt="""你是生活Vlog总剪辑师。只根据人工意见生成紧凑的编辑意图JSON，不要输出timeline、start或end；程序会按真实素材时长构建并校验时间线。制作备注和人工意见优先。"""+DUAL_STYLE+SHORT_AUDIO_STYLE+"""根据素材故事密度建议long_target_minutes（10到60，可用小数，不要机械选择30），并提出1个由多个真实素材组合的抖音/小红书网感短篇主题，不能只摘一段精彩。只能引用真实asset_id。结构：{title,summary,long_target_minutes:数字,story_anchor:{topic,setup,payoff,asset_ids:[整数]},chapters:[{name}],asset_priorities:[{asset_id,priority:0到100,chapter}],shorts:[{title,hook,cover_text,core_payoff,pacing,voice_mode,voice_reason,asset_ids:[整数]}],music_mood:[字符串],review_warnings:[字符串]}。整个JSON保持精简，asset_priorities最多12项。"""+scope+"制作备注："+str(project.get("notes") or "无")+"\n人工意见："+json.dumps(revisions,ensure_ascii=False)+"\n素材："+json.dumps(catalog,ensure_ascii=False)+"\n现有计划概述："+json.dumps(compact_existing_plan(settings.get('story_plan',{})),ensure_ascii=False)
-        settings['story_plan']=generate_valid_plan(model,processor,prompt,assets,project['id'],"revision_requested");settings['story_model']=MODEL_NAME
+        source_timeline=[]
+        if source and source["format"]=="short_9x16":
+            try:source_timeline=(json.loads(source.get("timeline_snapshot") or "{}").get("short-1") or [])
+            except (AttributeError,TypeError,json.JSONDecodeError):source_timeline=[]
+        manual_short=_manual_short_for_revisions(revisions,assets,settings,project['id'],source['version'] if source else None,source_timeline) if source and source["format"]=="short_9x16" else None
+        if manual_short and valid_story_plan(settings.get("story_plan"),assets):
+            plan=dict(settings["story_plan"])
+        else:
+            prompt="""你是生活Vlog总剪辑师。只根据人工意见生成紧凑的编辑意图JSON，不要输出timeline、start或end；程序会按真实素材时长构建并校验时间线。制作备注和人工意见优先。"""+DUAL_STYLE+SHORT_AUDIO_STYLE+"""根据素材故事密度建议long_target_minutes（10到60，可用小数，不要机械选择30），并提出1个由多个真实素材组合的抖音/小红书网感短篇主题，不能只摘一段精彩。只能引用真实asset_id。结构：{title,summary,long_target_minutes:数字,story_anchor:{topic,setup,payoff,asset_ids:[整数]},chapters:[{name}],asset_priorities:[{asset_id,priority:0到100,chapter}],shorts:[{title,hook,cover_text,core_payoff,pacing,voice_mode,voice_reason,asset_ids:[整数]}],music_mood:[字符串],review_warnings:[字符串]}。整个JSON保持精简，asset_priorities最多12项。"""+scope+"制作备注："+str(project.get("notes") or "无")+"\n人工意见："+json.dumps(revisions,ensure_ascii=False)+"\n素材："+json.dumps(catalog,ensure_ascii=False)+"\n现有计划概述："+json.dumps(compact_existing_plan(settings.get('story_plan',{})),ensure_ascii=False)
+            planning_model,planning_processor=get_model()
+            plan=generate_valid_plan(planning_model,planning_processor,prompt,assets,project['id'],"revision_requested");settings['story_model']=MODEL_NAME
+        if manual_short:
+            plan["shorts"]=[manual_short];plan["generation_method"]="structured_revision_v2"
+            manual=manual_short.get("manual_replan") or {}
+            db.log_event(project['id'],"success","剪辑方案生成","structured_revision",f"已按结构化意见重构短篇：{manual.get('actual_clip_count') or len(manual.get('sources') or [])} 段镜头 · {manual.get('target_seconds')} 秒 · 人声镜头 {manual.get('voice_clips') or []}",manual)
+        settings["story_plan"]=plan
         if not db.checkpoint(project['id'],"revision_requested",stage,"整套方案"):return
         if source:
             result=_finalize_version_bound_replan(project,settings,source,revisions)
@@ -305,7 +367,8 @@ def revise(project):
             db.create_control(project['id'],"stopped",None,"等待选择版本","修改方案已保存，请选择生成一个长篇或短篇版本")
             db.log_event(project['id'],"success",stage,"awaiting_version_selection","修改方案已保存；未自动加入成片队列，等待选择一个指定格式")
     finally:
-        del model,processor;gc.collect();torch.cuda.empty_cache()
+        if model is not None:del model,processor
+        gc.collect();torch.cuda.empty_cache()
 
 def main():
     db.init_db()

@@ -1,6 +1,9 @@
 import json
 import math
 import random
+import re
+
+from .revision_intent import parse_revision_intent
 
 
 DEFAULT_CHAPTERS=("出发与近况","沿途与街景","朋友相聚与饮食","交流与余韵")
@@ -345,6 +348,185 @@ def _build_short(definition,long_timeline,index,assets_by_id=None,style_seed=Non
     if len(clips)<minimum_clips or effective_total<requested*0.92:raise RuntimeError(f"短篇{index}多素材片段不足，目标{requested:.1f}秒、可编排{effective_total:.1f}秒")
     return {"title":str(definition.get("title") or f"短篇 {index}"),"hook":str(definition.get("hook") or "这段真实经历最后发生了什么？"),"cover_text":str(definition.get("cover_text") or definition.get("title") or f"短篇 {index}"),"core_payoff":str(definition.get("core_payoff") or "用真实画面和对话回答开头问题"),"pacing":str(definition.get("pacing") or "按BGM节拍密集切换，精选人声只保留关键一句"),"editorial_style":"douyin_polished_v3_bgm_led" if bgm_led else "douyin_polished_v2","style_profile":profile["name"],"voice_mode":voice_mode,"voice_reason":str(definition.get("voice_reason") or ("主题需要真实人声点题" if voice_mode=="selective_dialogue" else "画面与BGM足以完成叙事")),"caption_policy":"voice_only" if voice_clips else "none","voice_clips":voice_clips,"flash_bursts":flash_bursts,"timeline":clips}
 
+
+
+def _manual_source_code(filename):
+    match=re.search(r"_(\d{4})_D\.[^.]+$",str(filename or ""),re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _manual_asset_score(asset):
+    analysis=_analysis(asset);visual=analysis.get("visual") if isinstance(analysis.get("visual"),dict) else {}
+    quality=float(visual.get("quality") or 50);story=float(visual.get("story_value") or 50)
+    duplicate_penalty=45 if visual.get("duplicate_hint") else 0
+    return quality*0.56+story*0.44-duplicate_penalty
+
+
+def _manual_suggested_start(asset):
+    duration=_duration(asset)
+    if duration<=2.4:return 0.0
+    analysis=_analysis(asset);stamps=analysis.get("time_stamps") if isinstance(analysis.get("time_stamps"),list) else []
+    valid=[]
+    for value in stamps:
+        try:start=float(value.get("start_time",value.get("start",0)));end=float(value.get("end_time",value.get("end",start)))
+        except (TypeError,ValueError,AttributeError):continue
+        if end-start>=0 and 0<=start<duration-0.5:valid.append(start)
+    if valid:return max(0.0,min(duration-1.6,valid[len(valid)//2]))
+    return max(0.0,min(duration-1.6,duration*0.28))
+
+
+def _manual_ranges_conflict(left,right,gap=1.25):
+    if int(left["asset_id"])!=int(right["asset_id"]):return False
+    return max(float(left["start"]),float(right["start"]))<min(float(left["end"]),float(right["end"]))+gap
+
+
+def _manual_range_from_recommendation(item,asset):
+    duration=_duration(asset);voice=item.get("audio_mode")=="dialogue";window=3.2 if voice else 2.3
+    timestamp=item.get("time_seconds")
+    if timestamp is None:start=_manual_suggested_start(asset)
+    else:
+        timestamp=max(0.0,min(duration,float(timestamp)))
+        if item.get("time_mode")=="after":start=timestamp
+        elif duration-timestamp<0.8:start=max(0.0,duration-1.65)
+        else:start=max(0.0,timestamp-0.45)
+    end=min(duration,start+window)
+    if end-start<0.4:start=max(0.0,duration-window);end=duration
+    return {
+        "asset_id":int(asset["id"]),"start":round(start,3),"end":round(end,3),
+        "audio_mode":"dialogue" if voice else "mute","show_captions":False,
+        "background_cleanup":bool(item.get("background_cleanup")),"duck_bgm":bool(item.get("duck_bgm")),
+        "reason":item.get("label") or "人工推荐精彩镜头","origin":item.get("priority") or "preferred",
+        "filename":asset.get("filename"),"requested_time":item.get("time_seconds"),
+    }
+
+
+def _manual_candidate_from_asset(asset,origin="ai_selected"):
+    start=_manual_suggested_start(asset);duration=_duration(asset);end=min(duration,start+2.4)
+    if end-start<0.4:start=max(0.0,duration-1.2);end=duration
+    return {"asset_id":int(asset["id"]),"start":round(start,3),"end":round(end,3),"audio_mode":"mute","show_captions":False,"reason":"依据本地画面分析补足节奏镜头","origin":origin,"filename":asset.get("filename")}
+
+
+def _build_manual_structured_short(definition,ranges,assets_by_id,style_seed=None,target_seconds=None,rhythm_marks=None):
+    """Build a fixed-count BGM short from distinct, non-overlapping ranges."""
+    profile=_short_profiles(1,style_seed);requested=float(target_seconds if target_seconds is not None else profile["target_seconds"])
+    requested=max(10.0,min(600.0,requested));prepared=[]
+    for value in ranges:
+        try:asset_id=int(value["asset_id"]);start=float(value["start"]);end=float(value["end"])
+        except (KeyError,TypeError,ValueError):continue
+        if asset_id not in assets_by_id or end-start<0.4:continue
+        prepared.append({**value,"asset_id":asset_id,"start":start,"end":end,"available":end-start})
+    if len(prepared)<4:raise RuntimeError("人工重选短篇没有足够的不同画面")
+    lengths=[min(value["available"],3.0 if value.get("audio_mode")=="dialogue" else 0.95) for value in prepared]
+    transitions=[]
+    for index in range(len(prepared)):
+        transition="cut"
+        if index and index in profile["accent_positions"]:transition=profile["accent_positions"][index]
+        transition_duration=0.0 if transition=="cut" else (0.20 if transition in {"fadewhite","fadeblack"} else 0.24)
+        transitions.append((transition,transition_duration))
+    effective=sum(lengths)-sum(duration for _,duration in transitions)
+    if effective>requested:
+        excess=effective-requested
+        for index in sorted(range(len(prepared)),key=lambda value:lengths[value],reverse=True):
+            if excess<=0.001:break
+            floor=1.6 if prepared[index].get("audio_mode")=="dialogue" else 0.4
+            reduction=min(max(0.0,lengths[index]-floor),excess);lengths[index]-=reduction;excess-=reduction
+        if excess>0.03:raise RuntimeError(f"保持镜头数后最短时长仍超过 BGM：{excess:.2f} 秒")
+    else:
+        remaining=requested-effective
+        order=sorted(range(len(prepared)),key=lambda value:((prepared[value].get("origin") in {"required","preferred"}),prepared[value]["available"]-lengths[value]),reverse=True)
+        for index in order:
+            if remaining<=0.001:break
+            room=max(0.0,prepared[index]["available"]-lengths[index]);extension=min(room,remaining)
+            lengths[index]+=extension;remaining-=extension
+        if remaining>0.03:raise RuntimeError(f"保持镜头数后素材有效时长不足以匹配 BGM：还差 {remaining:.2f} 秒")
+        if remaining>0:lengths[-1]+=remaining
+    rhythm=sorted({round(float(value),3) for value in (rhythm_marks or []) if 0<float(value)<requested})
+    clips=[];flash_bursts=[];voice_clips=[];effective_total=0.0
+    for index,(value,length) in enumerate(zip(prepared,lengths)):
+        transition,transition_duration=transitions[index];clip_effective=length-transition_duration
+        beat=next((mark for mark in rhythm if effective_total-0.02<=mark<=effective_total+clip_effective+0.02),None)
+        audio_mode="dialogue" if value.get("audio_mode")=="dialogue" else "mute"
+        effect="flash_frame" if beat is not None and index%2==0 else _short_effect(profile,{"audio_mode":audio_mode},index)
+        if beat is not None and beat not in flash_bursts:flash_bursts.append(beat)
+        if audio_mode=="dialogue":voice_clips.append(index+1)
+        clips.append({
+            "asset_id":value["asset_id"],"start":round(value["start"],3),"end":round(value["start"]+length,3),
+            "reason":"BGM能量点快闪" if beat is not None else str(value.get("reason") or "按BGM节拍在不同场景之间推进"),
+            "audio_mode":audio_mode,"show_captions":False,"background_cleanup":bool(value.get("background_cleanup")),"duck_bgm":bool(value.get("duck_bgm")),
+            "effect":effect,"transition":transition,"transition_duration":transition_duration,
+        })
+        effective_total+=clip_effective
+    voice_mode="selective_dialogue" if voice_clips else "bgm_only"
+    return {"title":str(definition.get("title") or "人工意见重构短篇"),"hook":str(definition.get("hook") or "这趟旅程到底有多跳？"),"cover_text":str(definition.get("cover_text") or "社员旅行高能片段"),"core_payoff":str(definition.get("core_payoff") or "用推荐镜头与本地AI选材完成节奏收束"),"pacing":str(definition.get("pacing") or "保持来源母版镜头数，按BGM节拍替换重复画面"),"editorial_style":"douyin_polished_v4_revision_constraints","style_profile":profile["name"],"voice_mode":voice_mode,"voice_reason":"仅人工指定片段保留清理后原声" if voice_clips else "画面与BGM完成叙事","caption_policy":"none","voice_clips":voice_clips,"flash_bursts":flash_bursts,"timeline":clips}
+
+
+def manual_short_reselection(revisions,assets,style_seed=None,target_seconds=None,rhythm_marks=None,base_timeline=None):
+    """Apply structured version feedback while preserving source clip count."""
+    intent=parse_revision_intent(revisions,len(base_timeline or []))
+    if not intent.get("recommendations") and not intent.get("deletions"):return None
+    assets_by_id={int(asset["id"]):asset for asset in assets};assets_by_code={}
+    for asset in assets:
+        code=_manual_source_code(asset.get("filename"))
+        if code and code not in assets_by_code:assets_by_code[code]=asset
+    target=max(4,int(intent.get("target_clip_count") or len(base_timeline or []) or len(intent.get("recommendations") or [])))
+    slots=[None]*target;selected=[];warnings=list(intent.get("warnings") or []);recommended_codes={value["asset_code"] for value in intent.get("recommendations") or []};deleted_codes={value["asset_code"] for value in intent.get("deletions") or []}
+
+    def place(candidate,target_index=None):
+        if not candidate or any(_manual_ranges_conflict(candidate,existing) for existing in selected):return False
+        position=None
+        if target_index is not None and 1<=int(target_index)<=len(slots) and slots[int(target_index)-1] is None:position=int(target_index)-1
+        if position is None:
+            position=next((index for index,value in enumerate(slots) if value is None),None)
+        if position is None:return False
+        slots[position]=candidate;selected.append(candidate);return True
+
+    recommendations=list(intent.get("recommendations") or [])
+    recommendations.sort(key=lambda value:(value.get("target_clip_index") is None,value.get("priority")!="required"))
+    for item in recommendations:
+        asset=assets_by_code.get(item["asset_code"])
+        if not asset:
+            message=f"找不到推荐素材 _{item['asset_code']}_D.MP4"
+            if item.get("priority")=="required":raise RuntimeError(message)
+            warnings.append(message);continue
+        candidate=_manual_range_from_recommendation(item,asset)
+        if not place(candidate,item.get("target_clip_index")):
+            message=f"推荐镜头无法加入（位置冲突或画面区间重复）：{asset.get('filename')}"
+            if item.get("priority")=="required":raise RuntimeError(message)
+            warnings.append(message)
+
+    base_seen=set()
+    for item in base_timeline or []:
+        try:asset_id=int(item.get("asset_id"));start=float(item.get("start"));end=float(item.get("end"))
+        except (TypeError,ValueError,AttributeError):continue
+        asset=assets_by_id.get(asset_id);code=_manual_source_code(asset.get("filename")) if asset else None
+        if not asset or code in deleted_codes or code in recommended_codes or asset_id in base_seen or end-start<0.4:continue
+        base_seen.add(asset_id)
+        place({"asset_id":asset_id,"start":start,"end":end,"audio_mode":"mute","show_captions":False,"reason":"保留来源母版中的有效非重复镜头","origin":"retained_existing","filename":asset.get("filename")})
+
+    ranked=sorted((asset for asset in assets if _duration(asset)>=0.4 and _manual_source_code(asset.get("filename")) not in deleted_codes),key=_manual_asset_score,reverse=True)
+    used_assets={int(value["asset_id"]) for value in selected}
+    for asset in ranked:
+        if all(slots):break
+        if int(asset["id"]) in used_assets:continue
+        if place(_manual_candidate_from_asset(asset)):
+            used_assets.add(int(asset["id"]))
+    if not all(slots):
+        for fraction in (0.62,0.82,0.12,0.42):
+            for asset in ranked:
+                if all(slots):break
+                duration=_duration(asset);start=max(0.0,min(duration-1.2,duration*fraction))
+                candidate={"asset_id":int(asset["id"]),"start":round(start,3),"end":round(min(duration,start+2.2),3),"audio_mode":"mute","show_captions":False,"reason":"同一原片中的相隔精彩画面补足镜头数","origin":"ai_selected_distinct_range","filename":asset.get("filename")}
+                place(candidate)
+            if all(slots):break
+    if not all(slots):raise RuntimeError(f"保持 {target} 段镜头后仍缺少 {sum(value is None for value in slots)} 个可去重画面")
+    ranges=list(slots)
+    definition={"title":"人工意见重构短篇","hook":"从食物、缆车到山景，这趟社员旅行有多跳？","cover_text":"社员旅行高能片段","core_payoff":"以人工推荐镜头为锚点，由本地画面分析补足完整节奏","pacing":"保持上一母版镜头数，替换重复画面，并按BGM鼓点密集切换"}
+    short=_build_manual_structured_short(definition,ranges,assets_by_id,style_seed,target_seconds,rhythm_marks)
+    counts={}
+    for item in short["timeline"]:counts[int(item["asset_id"])]=counts.get(int(item["asset_id"]),0)+1
+    sources=[{"asset_id":value["asset_id"],"filename":value.get("filename"),"start":round(float(value["start"]),3),"end":round(float(value["end"]),3),"origin":value.get("origin")} for value in ranges]
+    short["manual_replan"]={"mode":"structured_revision_v2","sources":sources,"selection_policy":"recommendations_plus_ai_fill_preserve_count","parsed_intent":intent,"warnings":warnings,"subtitle_mode":"none","original_audio_mode":"selective_dialogue" if short.get("voice_clips") else "mute","beat_flashcuts":True,"repeat_policy":"distinct_nonoverlapping_time_ranges","same_asset_multiple_count":sum(value-1 for value in counts.values() if value>1),"source_clip_count":len(base_timeline or []),"target_clip_count":target,"actual_clip_count":len(short["timeline"]),"target_seconds":round(_effective_short_seconds(short["timeline"]),3),"flash_burst_count":len(short.get("flash_bursts") or []),"voice_clips":short.get("voice_clips") or []}
+    return short
 
 def rebuild_short_plans(existing_shorts,long_timeline,assets,style_seed,target_seconds=None,max_outputs=1,bgm_led=False,rhythm_marks=None):
     """Rebuild short edits from an already approved/revised long timeline.

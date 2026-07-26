@@ -234,6 +234,18 @@ def _music_mix_filter(fmt,target_seconds=None):
         return f"[0:a]apad=whole_dur={target:.3f},asplit=2[base_mix][base_side];[1:a]atrim=duration={target:.3f},volume=0.26[bg];[bg][base_side]sidechaincompress=threshold=0.015:ratio=10:attack=15:release=280[ducked];[base_mix][ducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[a]"
     return "[1:a]volume=0.08[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]"
 
+def _segment_audio_filter(item):
+    audio_mode=str(item.get("audio_mode") or "montage")
+    dialogue_filter="highpass=f=80,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,volume=0.90"
+    if item.get("background_cleanup"):
+        dialogue_filter="highpass=f=95,lowpass=f=10500,afftdn=nf=-32,loudnorm=I=-16:TP=-1.5:LRA=9,volume=0.96"
+    return {
+        "dialogue":dialogue_filter,
+        "ambient":"highpass=f=45,loudnorm=I=-21:TP=-2:LRA=14,volume=0.55",
+        "montage":"highpass=f=80,afftdn=nf=-25,loudnorm=I=-23:TP=-2:LRA=11,volume=0.18",
+        "mute":"volume=0",
+    }.get(audio_mode,"highpass=f=80,afftdn=nf=-25,loudnorm=I=-23:TP=-2:LRA=11,volume=0.18")
+
 def _concat_segments(segments,merged,temp,expected_duration=None):
     concat=temp/"concat.txt";concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in segments),encoding="utf-8")
     command=["ffmpeg","-y","-f","concat","-safe","0","-i",str(concat),"-c","copy"]
@@ -283,14 +295,7 @@ def render_timeline(assets,timeline,fmt: str,target:Path,temp:Path,music_files=(
         start=max(0,float(item.get('start',0)));end=min(float(asset.get('duration') or 0),float(item.get('end',asset.get('duration') or 0)))
         if end-start<0.25:continue
         segment=temp/f"{idx:04d}.mp4"
-        audio_mode=str(item.get('audio_mode') or 'montage')
-        audio_filters={
-            "dialogue":"highpass=f=80,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,volume=0.90",
-            "ambient":"highpass=f=45,loudnorm=I=-21:TP=-2:LRA=14,volume=0.55",
-            "montage":"highpass=f=80,afftdn=nf=-25,loudnorm=I=-23:TP=-2:LRA=11,volume=0.18",
-            "mute":"volume=0",
-        }
-        common=["ffmpeg","-y","-ss",str(start),"-t",str(end-start),"-i",asset['path'],"-vf",_video_filter(fmt,item),"-af",audio_filters.get(audio_mode,audio_filters["montage"]),"-r","30"]
+        common=["ffmpeg","-y","-ss",str(start),"-t",str(end-start),"-i",asset['path'],"-vf",_video_filter(fmt,item),"-af",_segment_audio_filter(item),"-r","30"]
         nvenc=common+["-c:v","h264_nvenc","-preset","p4","-cq","23","-b:v","0","-c:a","aac","-b:a","192k",str(segment)]
         cpu=common+["-c:v","libx264","-preset","fast","-crf","23","-c:a","aac","-b:a","192k",str(segment)]
         try:run(nvenc)

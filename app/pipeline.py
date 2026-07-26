@@ -136,6 +136,7 @@ def subtitle_render_once():
                      JOIN projects p ON p.id=e.project_id
                      JOIN project_control c ON c.project_id=p.id
                      WHERE e.status='subtitle_render_requested' AND c.desired_state='running'
+                       AND p.status IN ('subtitle_render_requested','subtitle_rendering')
                        AND (c.render_scope IS NULL OR c.render_scope=e.format)
                      ORDER BY e.id LIMIT 1""")
     if not export:return
@@ -191,6 +192,7 @@ def render_once():
                      JOIN projects p ON p.id=e.project_id
                      JOIN project_control c ON c.project_id=p.id
                      WHERE e.status='render_requested' AND c.desired_state='running'
+                       AND p.status IN ('render_requested','rendering')
                        AND (c.render_scope IS NULL OR c.render_scope=e.format)
                      ORDER BY e.id LIMIT 1""")
     if not export:return
