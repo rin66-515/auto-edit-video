@@ -4,12 +4,14 @@ let currentProjectId=null;
 let currentProjectStatus=null;
 let assetCaptionSignature=null;
 let allAssetCaptionsComplete=false;
+const currentProjectStorageKey='vlog-current-project-id';
 
-const statusNames={waiting_start:'等待启动',ready_for_audio:'等待音频清理',audio_cleaning:'音频清理中',audio_failed:'音频清理失败',ready_for_ai:'等待语音转写',transcribing:'语音转写中',asr_failed:'语音转写失败',ready_for_visual:'等待画面分析',visual_analyzing:'画面与字幕分析中',visual_failed:'视觉分析失败',draft_ready:'剪辑方案已生成',revision_requested:'等待修改方案',revision_planning:'正在修改方案',replan_requested:'等待版本重规划',superseded:'已由重规划版本替代',scheduled:'等待前序版本完成',render_requested:'等待母版渲染',rendering:'母版渲染中',render_failed:'母版渲染失败',caption_review_ready:'等待成片字幕校对',subtitle_render_requested:'等待字幕快速生成',subtitle_rendering:'字幕快速生成中',subtitle_render_failed:'字幕快速生成失败',review_ready:'等待最终审核',published:'已发布',expired:'保留期已到，文件已删除',preprocessing:'素材导入中'};
+const statusNames={waiting_start:'等待启动',ready_for_audio:'等待音频清理',audio_cleaning:'音频清理中',audio_failed:'音频清理失败',ready_for_ai:'等待语音转写',transcribing:'语音转写中',asr_failed:'语音转写失败',ready_for_visual:'等待画面分析',visual_analyzing:'画面与字幕分析中',visual_failed:'视觉分析失败',draft_ready:'剪辑方案已生成',revision_requested:'等待修改方案',revision_planning:'正在修改方案',replan_requested:'等待版本重规划',superseded:'已由重规划版本替代',scheduled:'等待前序版本完成',render_requested:'等待母版渲染',rendering:'母版渲染中',render_failed:'母版渲染失败',caption_review_ready:'等待成片字幕校对',subtitle_render_requested:'等待字幕快速生成',subtitle_rendering:'字幕快速生成中',subtitle_render_failed:'字幕快速生成失败',review_ready:'等待最终审核',approved:'已批准锁定',published:'已发布',expired:'保留期已到，文件已删除',preprocessing:'素材导入中'};
 const controlNames={importing:'正在导入',running:'运行中',pause_requested:'正在安全暂停',paused:'已暂停',stop_requested:'正在安全停止',stopped:'已停止'};
 const actionNames={start:'启动项目',pause:'暂停',stop:'停止',continue:'继续'};
 const workerNames={audio:'音频清理',asr:'语音识别',visual:'画面分析'};
 const formatNames={long_16x9:'长篇 16:9',short_9x16:'短篇 9:16',both:'长篇 + 短篇'};
+const revisionKindHelp={edit:'用于按成片时间删除、插入或调整局部内容；严格继承所选版本的其余部分。',shot:'用于替换明确镜头编号或指定原素材时间段。',audio:'只调整人声、BGM、降噪和环境音，不重新规划画面。',duration:'只调整局部时长或章节边界；请写明成片时间点。',style:'只调整局部节奏、转场或特效，不重新选整片素材。',privacy:'只按人工时间段添加或去除普通马赛克。',full_replan:'仅在需要推翻整条故事结构和重新选材时使用；明确成片时间码不能使用此项。'};
 const escJson=value=>{try{return esc(typeof value==='string'?value:JSON.stringify(value,null,2))}catch{return esc(value)}};
 
 async function api(url,opt){const r=await fetch(url,opt);if(!r.ok){let msg=await r.text();try{msg=JSON.parse(msg).detail||msg}catch{}throw new Error(msg)}return r.json()}
@@ -28,28 +30,36 @@ async function load(){
   $('#health').textContent=`D盘可用 ${h.free_gib} GiB`;$('#health').className=h.free_gib<h.minimum_free_gib?'bad':'ok';
   $('#projects').innerHTML=projectButtons(ps);
   document.querySelectorAll('.project').forEach(b=>b.onclick=()=>show(b.dataset.id));
+  if(!currentProjectId&&ps.length){
+    const remembered=Number(localStorage.getItem(currentProjectStorageKey)),target=ps.find(value=>Number(value.id)===remembered)||ps[0];
+    await show(target.id,true);
+  }
 }
 
-function exportHtml(e,canDelete,pendingReplanCount=0){
+function exportHtml(e,canDelete,pendingRevisionCount=0,pendingPrivacyCount=0,pendingFullReplanCount=0,isLatest=false){
   const files=e.path?(()=>{try{return JSON.parse(e.path)}catch{return[e.path]}})():[];
   const previews=files.map((_,i)=>`<video controls preload="metadata" src="/api/exports/${e.id}/files/${i}"></video>`).join('');
   let manifest={};try{manifest=JSON.parse(e.master_manifest||'{}')}catch{}
-  const masters=Array.isArray(manifest.outputs)?manifest.outputs:[],masterPreviews=masters.map((output,i)=>`<div class="master-preview"><div><b>${esc(output.name||`成片${i+1}`)}</b><span>马赛克母版 · 软字幕预览</span></div><video controls preload="metadata" src="/api/exports/${e.id}/masters/${i}"><track kind="subtitles" srclang="zh" label="中日字幕" src="/api/exports/${e.id}/captions/${i}.vtt?r=${Number(e.caption_revision)||0}" default></video></div>`).join('');
+  const masters=Array.isArray(manifest.outputs)?manifest.outputs:[],masterPreviews=masters.map((output,i)=>`<div class="master-preview"><div><b>${esc(output.name||`成片${i+1}`)}</b><span>隐私母版 · 未指定马赛克时保持原画 · 软字幕预览</span></div><video controls preload="metadata" src="/api/exports/${e.id}/masters/${i}"><track kind="subtitles" srclang="zh" label="中日字幕" src="/api/exports/${e.id}/captions/${i}.vtt?r=${Number(e.caption_revision)||0}" default></video></div>`).join('');
   const activeStatuses=['rendering','subtitle_rendering'],deletable=canDelete&&!activeStatuses.includes(e.status),format=formatNames[e.format]||e.format,captionReady=Boolean(e.timeline_snapshot)&&(files.length||masters.length)&&['caption_review_ready','subtitle_render_requested','subtitle_rendering','subtitle_render_failed','review_ready','approved'].includes(e.status);
   const captionEditable=e.status==='caption_review_ready';
+  const unlockButton=e.status==='approved'&&Number(e.locked)===1?`<button class="warning small" data-unlock-export="${e.id}" data-version="${esc(e.version)}" ${canDelete?'':'disabled'} title="${canDelete?'保留现有成片并恢复为待最终审核；之后可再次生成该格式的新版本':'请先暂停或停止项目'}">取消锁定</button>`:'';
   const captionTools=captionReady?`<div class="export-caption-tools"><span>成片字幕/时间点 · 已校对 ${Number(e.caption_revision)||0} 轮</span><button class="small" data-export-version-captions="${e.id}">导出 XLSX</button><button class="small" data-import-version-captions="${e.id}" data-version="${esc(e.version)}" ${captionEditable&&canDelete?'':'disabled'}>导入校对表</button>${captionEditable?`<button class="caption-lock" data-lock-captions="${e.id}" data-version="${esc(e.version)}" ${canDelete?'':'disabled'}>锁定字幕并生成成片</button>`:''}</div>`:'';
   const captionSummary=captionReady?`<div class="version-caption-summary" data-version-caption-summary="${e.id}"><p class="muted">正在读取该版本最终时间线字幕…</p></div>`:'';
   const discardMaster=captionEditable?`<button class="warning small" data-discard-master="${e.id}" data-version="${esc(e.version)}" ${canDelete?'':'disabled'} title="保留该版本的时间线与字幕修正，只删除当前母版文件并按当前方案重新渲染">废弃母版（按当前方案重渲染）</button>`:'';
-  const replanReady=captionEditable&&masters.length&&canDelete&&pendingReplanCount>0;
-  const discardAndReplan=captionEditable?`<button class="warning small" data-discard-replan="${e.id}" data-version="${esc(e.version)}" data-revision-count="${pendingReplanCount}" ${replanReady?'':'disabled'} title="${pendingReplanCount?`读取绑定到 ${e.version} 的 ${pendingReplanCount} 条意见，废弃当前母版并创建新版本`:`请先在下方选择 ${e.version} 并提交至少一条重规划意见`}">废弃并重规划（${pendingReplanCount} 条意见）</button>`:'';
-  return `<li class="export-version"><div class="export-version-title"><span><b>${esc(e.version)}</b> · ${esc(format)} · ${esc(statusNames[e.status]||e.status)}</span><span>${e.status==='review_ready'&&files.length?`<button data-approve="${e.id}">批准锁定</button>`:''}${discardMaster}${discardAndReplan}<button class="danger small" data-delete-export="${e.id}" data-version="${esc(e.version)}" data-format="${esc(format)}" data-status="${esc(statusNames[e.status]||e.status)}" ${deletable?'':'disabled'} title="${deletable?'删除该版本的成片、字幕及快速修正母版':'请先暂停或停止项目；正在渲染的版本不能删除'}">删除历史版本</button></span></div>${manualReplanSummaryHtml(e)}${masterPreviews}${previews}${captionSummary}${captionTools}</li>`;
+  const privacyReady=captionEditable&&masters.length&&canDelete&&pendingPrivacyCount>0;
+  const applyPrivacy=captionEditable?`<button class="small" data-apply-privacy="${e.id}" data-version="${esc(e.version)}" data-privacy-count="${pendingPrivacyCount}" ${privacyReady?'':'disabled'} title="${pendingPrivacyCount?`复用 ${e.version} 无字幕剪辑母版，只按 ${pendingPrivacyCount} 条人工意见生成普通马赛克快速版`:`请在下方选择 ${e.version} 并提交马赛克校对意见`}">应用马赛克意见（${pendingPrivacyCount}）</button>`:'';
+  const revisionReady=captionEditable&&canDelete&&pendingRevisionCount>0;
+  const applyRevisions=captionEditable?`<button class="${pendingFullReplanCount?'warning ':''}small" data-apply-revisions="${e.id}" data-version="${esc(e.version)}" data-revision-count="${pendingRevisionCount}" data-full-replan-count="${pendingFullReplanCount}" ${revisionReady?'':'disabled'} title="${pendingRevisionCount?pendingFullReplanCount?`明确执行完整重规划；${e.version} 来源母版仍会保留`:`继承 ${e.version} 的时间线，只应用 ${pendingRevisionCount} 条明确修改`:`请先在下方选择 ${e.version} 并提交版本意见`}">应用修改意见（${pendingRevisionCount}）</button>`:'';
+  return `<li id="export-version-${e.id}" class="export-version${isLatest?' latest-version':''}"><div class="export-version-title"><span><b>${esc(e.version)}</b>${isLatest?'<em class="latest-version-badge">最新</em>':''} · ${esc(format)} · ${esc(statusNames[e.status]||e.status)}</span><span>${e.status==='review_ready'&&files.length?`<button data-approve="${e.id}">批准锁定</button>`:''}${unlockButton}${applyPrivacy}${discardMaster}${applyRevisions}<button class="danger small" data-delete-export="${e.id}" data-version="${esc(e.version)}" data-format="${esc(format)}" data-status="${esc(statusNames[e.status]||e.status)}" ${deletable?'':'disabled'} title="${deletable?'删除该版本的成片、字幕及快速修正母版':'请先暂停或停止项目；正在渲染的版本不能删除'}">删除历史版本</button></span></div>${manualReplanSummaryHtml(e)}${masterPreviews}${previews}${captionSummary}${captionTools}</li>`;
 }
 
 function revisionScopeLabel(revision,exports=[]){
   const source=revision.source_export_id?exports.find(value=>Number(value.id)===Number(revision.source_export_id)):null;
-  if(!revision.source_version)return revision.status==='resolved'?'项目级 · 已应用到项目方案':'项目级 · 用于下一次项目级重规划';
+  if(!revision.source_version)return revision.status==='resolved'?'通用 · 已分别应用到长短篇方案':'通用 · 下一次分别规划长篇与短篇';
   const format=source?.format?` · ${formatNames[source.format]||source.format}`:'';
-  const applied=revision.applied_version?` · 已应用 ${revision.source_version} → ${revision.applied_version}`:revision.status==='open'?` · 待用于 ${revision.source_version} 重规划`:'';
+  const pendingAction=revision.kind==='privacy'?'马赛克校对':revision.kind==='full_replan'?'完整重规划':'增量修改';
+  const applied=revision.applied_version?` · 已应用 ${revision.source_version} → ${revision.applied_version}`:revision.status==='open'?` · 待用于 ${revision.source_version} ${pendingAction}`:'';
   return `版本级 · ${revision.source_version}${format}${applied}`;
 }
 
@@ -57,10 +67,18 @@ function revisionStatusLabel(revision){
   return {open:'待应用',resolved:'已应用到项目方案',applied:'已应用到新版本'}[revision.status]||revision.status;
 }
 
+function buttonGuideHtml(){
+  return `<details class="button-guide"><summary>按钮说明与正确操作顺序</summary><div class="button-guide-grid"><div><b>项目控制</b><span>“单独渲染长篇/短篇”处理对应等待队列；“一起渲染”仅在两边都没有锁定、待处理意见或继续任务时使用。</span></div><div><b>局部修改</b><span>删除、插入、替换指定时间点时选择“局部剪辑调整”或“指定镜头替换”，再到来源版本点击“应用修改意见”。</span></div><div><b>快速修正</b><span>马赛克意见复用无字幕母版；字幕导入只更新字幕与时间点，不重渲染画面剪辑。</span></div><div><b>完整重规划</b><span>只在推翻整条故事结构和重新选材时使用，会重写时间线；系统会继承未明确改变的来源时长与音频策略。</span></div></div><p>推荐顺序：生成画面母版 → 审核镜头 → 应用局部/马赛克意见 → 锁定画面 → 导出并校对字幕 → 锁定字幕生成成片 → 最终批准。</p></details>`;
+}
+
 function revisionIntentHtml(intent){
   if(!intent||!Array.isArray(intent.summary))return '';
   const time=value=>{const seconds=Number(value);if(!Number.isFinite(seconds))return '自动选点';const minutes=Math.floor(seconds/60),rest=seconds-minutes*60;return minutes?`${minutes}:${String(Math.floor(rest)).padStart(2,'0')}`:`${rest.toFixed(rest%1?1:0)}秒`};
-  const items=(intent.recommendations||[]).map(value=>`<li><b>${value.priority==='required'?'必须':'推荐'}</b> · ${esc(value.asset_code||value.filename)} · ${esc(time(value.time_seconds))}${value.target_clip_index?` · 镜头${Number(value.target_clip_index)}`:''}${value.audio_mode==='dialogue'?' · 保留降噪人声/BGM自动压低':' · 静音'}</li>`).join('');
+  const shotItems=(intent.recommendations||[]).map(value=>`<li><b>${value.priority==='required'?'必须':'推荐'}</b> · ${esc(value.asset_code||value.filename)} · ${esc(time(value.time_seconds))}${value.target_clip_index?` · 镜头${Number(value.target_clip_index)}`:''}${value.audio_mode==='dialogue'?' · 保留降噪人声/BGM自动压低':' · 静音'}</li>`).join('');
+  const deletionItems=(intent.output_deletions||[]).map(value=>`<li><b>删除成片</b> · ${esc(time(value.start_seconds))}–${esc(time(value.end_seconds))} · ${(Number(value.end_seconds)-Number(value.start_seconds)).toFixed(1)}秒</li>`).join('');
+  const insertionItems=(intent.insertions||[]).map(value=>`<li><b>插入镜头</b> · 成片 ${esc(time(value.output_at_seconds))} 后 · ${esc(value.asset_code||value.filename)} ${esc(time(value.source_start_seconds))}–${esc(time(value.source_end_seconds))}</li>`).join('');
+  const privacyItems=(intent.force_cover||[]).map(value=>`<li><b>普通马赛克</b> · ${esc(time(value.start))}–${esc(time(value.end))} · 提前 ${Number(value.lead_frames)||0} 帧 · 延后 ${Number(value.tail_frames)||0} 帧</li>`).join('');
+  const items=shotItems+deletionItems+insertionItems+privacyItems;
   const summary=intent.summary.map(value=>`<span>${esc(value)}</span>`).join('');
   const warnings=(intent.warnings||[]).map(value=>`<span class="warning-text">${esc(value)}</span>`).join('');
   return `<div class="revision-parsed"><b>系统解析</b>${summary}${items?`<ul>${items}</ul>`:''}${warnings}</div>`;
@@ -73,7 +91,7 @@ function manualReplanSummaryHtml(exportItem){
   const selection=manual.selection_policy==='recommendations_plus_ai_fill_preserve_count'?`保持 ${Number(manual.actual_clip_count)||0} 段，推荐镜头优先并由本地AI分析补齐`:manual.selection_policy==='required_sources_plus_curated_existing'?'已加入指定素材，并精简保留已有镜头':'仅使用上述素材';
   const repeatRule=manual.repeat_policy==='distinct_nonoverlapping_time_ranges'?'同一原片允许不同精彩片段，禁止重叠/相邻重复':manual.repeat_policy==='one_use_per_source'?'每个素材仅使用一次':'';
   const audioRule=manual.original_audio_mode==='selective_dialogue'?`仅镜头 ${(manual.voice_clips||[]).join('、')} 保留降噪人声，其余静音`:'无原声';
-  return `<p class="manual-replan-summary"><b>本版已按人工选材重构</b> · ${sources}<br>${esc(selection)}${repeatRule?` · ${esc(repeatRule)}`:''} · BGM ${esc(manual.bgm_filename||'未指定')} · ${esc(String(manual.target_seconds||'—'))} 秒 · ${esc(String(manual.flash_burst_count||0))} 组鼓点快闪 · ${esc(audioRule)}/无字幕母版</p>`;
+  return `<p class="manual-replan-summary"><b>本版已按人工选材重构</b> · ${sources}<br>${esc(selection)}${repeatRule?` · ${esc(repeatRule)}`:''} · BGM ${esc(manual.bgm_filename||options.bgm_filename||'未指定')} · ${esc(String(manual.target_seconds||'—'))} 秒 · ${esc(String(manual.flash_burst_count||0))} 组鼓点快闪 · ${esc(audioRule)}/无字幕母版</p>`;
 }
 
 function versionCaptionSummaryHtml(summary){
@@ -107,10 +125,23 @@ function controlsHtml(p){
   };
   const continuableStatuses=new Set(['render_requested','rendering','render_failed','subtitle_render_requested','subtitle_rendering','subtitle_render_failed','scheduled']);
   const continuable=(p.exports||[]).filter(value=>continuableStatuses.has(value.status));
-  const combinedBlocked=continuable.length>0,combinedReason=combinedBlocked?'已有待继续任务：'+continuable.map(value=>value.version+' · '+(formatNames[value.format]||value.format)).join('、')+'。请单独处理后再一起渲染。':'';  if(renderStage||p.status==='draft_ready'){
+  const exportFormats=new Map((p.exports||[]).map(value=>[Number(value.id),value.format]));
+  const pendingRevisionFormats=new Set((p.revisions||[]).filter(value=>value.status==='open'&&value.kind!=='privacy'&&value.source_export_id).map(value=>exportFormats.get(Number(value.source_export_id))).filter(Boolean));
+  const longRevisionReason=pendingRevisionFormats.has('long_16x9')?'长篇存在待应用版本意见；请先在对应版本点击“应用修改意见”。':'';
+  const shortRevisionReason=pendingRevisionFormats.has('short_9x16')?'短篇存在待应用版本意见；请先在对应版本点击“应用修改意见”。':'';
+  const lockedShort=p.locked_short||(p.exports||[]).find(value=>value.format==='short_9x16'&&value.status==='approved'&&Number(value.locked)===1);
+  const shortLockReason=lockedShort?`短篇 ${lockedShort.version} 已批准锁定；请先在历史版本中取消锁定。`:'';
+  const combinedReasons=[];
+  if(continuable.length)combinedReasons.push('已有待继续任务：'+continuable.map(value=>value.version+' · '+(formatNames[value.format]||value.format)).join('、')+'。请单独处理后再一起渲染。');
+  if(shortLockReason)combinedReasons.push(shortLockReason);
+  if(longRevisionReason)combinedReasons.push(longRevisionReason);
+  if(shortRevisionReason)combinedReasons.push(shortRevisionReason);
+  const combinedBlocked=combinedReasons.length>0,combinedReason=combinedReasons.join(' ');
+  const renderButtonStatuses=new Set(['draft_ready','review_ready','caption_review_ready','approved','render_requested','rendering','render_failed']);
+  if(renderStage||renderButtonStatuses.has(p.status)){
     const longLabel=longCount?`继续渲染 ${esc(longVersion||'')} · 长篇`:'单独渲染长篇';
     const shortLabel=shortCount?`继续渲染 ${esc(shortVersion||'')} · 短篇`:'单独渲染短篇';
-    const renderButtons=`<button class="control-render-long" data-generate="long_16x9" ${renderState?'':'disabled'}>${longLabel}</button><button class="control-render-short" data-generate="short_9x16" ${renderState?'':'disabled'}>${shortLabel}</button><button class="control-render-both" data-generate="both" ${renderState&&!combinedBlocked?'':'disabled'} title="${esc(combinedReason)}">长短篇一起渲染</button>`;
+    const renderButtons=`<button class="control-render-long" data-generate="long_16x9" ${renderState&&!longRevisionReason?'':'disabled'} title="${esc(longRevisionReason)}">${longLabel}</button><button class="control-render-short" data-generate="short_9x16" ${renderState&&!lockedShort&&!shortRevisionReason?'':'disabled'} title="${esc(shortLockReason||shortRevisionReason)}">${shortLabel}</button><button class="control-render-both" data-generate="both" ${renderState&&!combinedBlocked?'':'disabled'} title="${esc(combinedReason)}">长短篇一起渲染</button>`;
     return renderButtons+['pause','stop'].map(action=>`<button class="control-${action}" data-control="${action}" ${allowed[action]?'':'disabled'}>${actionNames[action]}</button>`).join('');
   }
   return Object.entries(actionNames).map(([action,label])=>`<button class="control-${action}" data-control="${action}" ${allowed[action]?'':'disabled'}>${label}</button>`).join('');
@@ -186,7 +217,15 @@ function currentSettingsPayload(p){
   return {
     mode:$('#mode')?.value||p.mode,
     notes:$('#notes')?.value??p.notes,
-    settings:{...(p.settings||{}),short_bgm:{filename}},
+    settings:{
+      ...(p.settings||{}),
+      short_bgm:{filename},
+      editorial_rules:{
+        common:String($('#common-rules')?.value||'').trim(),
+        long_16x9:String($('#long-rules')?.value||'').trim(),
+        short_9x16:String($('#short-rules')?.value||'').trim(),
+      },
+    },
   };
 }
 
@@ -219,10 +258,13 @@ function wireControls(p){
   });
 }
 
-async function show(id){
+async function show(id,revealLatest=false){
   currentProjectId=Number(id);
-  const p=await api('/api/projects/'+id),uploaded=new Set(p.uploads.filter(x=>x.completed_at).map(x=>x.platform)),story=p.settings?.story_plan,approved=new Set(p.exports.filter(x=>x.status==='approved'&&x.path&&x.path!=='[]').map(x=>x.format));
-  const pendingReplans=Object.fromEntries(p.exports.map(e=>[e.id,p.revisions.filter(r=>r.status==='open'&&Number(r.source_export_id)===Number(e.id)).length]));
+  localStorage.setItem(currentProjectStorageKey,String(currentProjectId));
+  const p=await api('/api/projects/'+id),uploaded=new Set(p.uploads.filter(x=>x.completed_at).map(x=>x.platform)),story=p.settings?.story_plan,approved=new Set(p.exports.filter(x=>x.status==='approved'&&x.path&&x.path!=='[]').map(x=>x.format)),editorialRules=p.settings?.editorial_rules||{};
+  const pendingRevisions=Object.fromEntries(p.exports.map(e=>[e.id,p.revisions.filter(r=>r.status==='open'&&r.kind!=='privacy'&&Number(r.source_export_id)===Number(e.id)).length]));
+  const pendingFullReplans=Object.fromEntries(p.exports.map(e=>[e.id,p.revisions.filter(r=>r.status==='open'&&r.kind==='full_replan'&&Number(r.source_export_id)===Number(e.id)).length]));
+  const pendingPrivacy=Object.fromEntries(p.exports.map(e=>[e.id,p.revisions.filter(r=>r.status==='open'&&r.kind==='privacy'&&Number(r.source_export_id)===Number(e.id)).length]));
   const replanTargets=p.exports.filter(e=>e.status==='caption_review_ready');
   const canManageRevisions=['stopped','paused'].includes(p.control?.desired_state);
   currentProjectStatus=p.status;
@@ -235,25 +277,30 @@ async function show(id){
       <div class="control-location"><span>当前阶段</span><b id="control-stage">${esc(p.control?.stage||statusNames[p.status]||p.status)}</b><span>当前位置</span><b id="control-item">${esc(p.control?.item||'等待操作')}</b></div>
     </div>
     <div class="cards">
-      <div class="card"><h3>制作设定</h3><label>模式<select id="mode"><option value="existing">已有素材重建故事</option><option value="scripted">脚本驱动拍摄</option></select></label><label>短篇指定 BGM<input id="short-bgm" value="${esc(p.settings?.short_bgm?.filename||'')}" placeholder="例如 my-song.mp3（放入音乐库）"></label><p class="muted">留空则不配乐；点击短篇或长短篇渲染时会自动保存并校验，短篇按 BGM 实际时长编排。</p><label>母版生成前的剪辑方案备注<textarea id="notes" placeholder="风格、重要事件、不要使用的内容……">${esc(p.notes)}</textarea></label><p class="muted">只用于初次剪辑方案或主动重规划；不会直接修改已经生成的母版。</p><button id="save">保存设定</button></div>
+      <div class="card rule-settings"><h3>制作设定与规则范围</h3><label>模式<select id="mode"><option value="existing">已有素材重建故事</option><option value="scripted">脚本驱动拍摄</option></select></label><label>素材与故事背景（只写事实）<textarea id="notes" placeholder="人物、地点、事件顺序、值得记录的内容……">${esc(p.notes)}</textarea></label><label>通用补充规则<textarea id="common-rules" placeholder="同时适用于长篇和短篇的规则">${esc(editorialRules.common||'')}</textarea></label><div class="rule-scope-grid"><label class="long-rule">长篇 16:9 独有规则<textarea id="long-rules" placeholder="长篇时长、叙事、音频、章节等">${esc(editorialRules.long_16x9||'')}</textarea></label><label class="short-rule">短篇 9:16 独有规则<textarea id="short-rules" placeholder="短篇节奏、BGM、选材、特效等">${esc(editorialRules.short_9x16||'')}</textarea></label></div><label>短篇指定 BGM<input id="short-bgm" value="${esc(p.settings?.short_bgm?.filename||'')}" placeholder="例如 my-song.mp3（放入音乐库）"></label><p class="muted">规则优先级：版本明确意见 ＞ 对应格式独有规则 ＞ 通用规则 ＞ AI判断。长篇与短篇分别规划并从全部素材独立选材；BGM只作用于短篇。</p><button id="save">保存设定</button></div>
       <div class="card"><h3>AI剪辑方案</h3>${story?`<p>${esc(story.summary||story.title||'')}</p><details><summary>查看完整可编辑时间线</summary><pre>${escJson(story)}</pre></details>`:'<p class="muted">等待音频、字幕和画面分析完成。</p>'}</div>
     </div>
-    <div class="card export-card"><h3>历史版本与成片审核</h3><p class="muted export-help">这里是母版之后的人工审核中心。先检查母版和该版本最终时间线字幕；可反复导出 XLSX，在 Excel 中修正时间点、中日字幕、保留/省略和复核状态后导回。“按当前方案重渲染”会保留时间线；“废弃并重规划”只读取绑定到该版本的意见，并创建一个新版本。</p><ul>${p.exports.map(e=>exportHtml(e,['stopped','paused'].includes(p.control?.desired_state),pendingReplans[e.id]||0)).join('')||'<li>尚无输出</li>'}</ul><input id="export-caption-workbook-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden></div>
-    <div class="card"><h3>剪辑方案重规划意见</h3><p class="muted">先选择关联范围和意见类型，再填写内容。点击该版本的“废弃并重规划”时，只会读取绑定到它的待应用意见；生成后会记录“来源版本 → 新版本”。未关联版本的意见用于项目级重规划。</p><div class="row replan-controls"><label>关联范围<select id="revision-target"><option value="">项目级（不绑定版本）</option>${replanTargets.map(e=>`<option value="${e.id}">基于 ${esc(e.version)} · ${esc(formatNames[e.format]||e.format)}</option>`).join('')}</select></label><label>意见类型<select id="kind"><option value="edit">剪辑结构</option><option value="shot">镜头取舍</option><option value="duration">时长/章节</option><option value="style">风格/节奏</option></select></label><button id="open-replan-dialog">填写重规划意见</button></div><ul>${p.revisions.map(r=>`<li class="revision-item"><div class="revision-item-copy"><div class="revision-meta"><span class="revision-scope">${esc(revisionScopeLabel(r,p.exports))}</span><span class="revision-state">${esc(revisionStatusLabel(r))}</span></div><div class="revision-body"><b>${esc(r.kind)}</b> ${esc(r.body)}</div>${revisionIntentHtml(r.parsed_intent)}</div><button class="danger small" data-delete-revision="${r.id}" data-revision-status="${esc(r.status)}" ${canManageRevisions?'':'disabled'} title="${canManageRevisions?'删除该条规划意见；已完成的意见不会回滚现有方案或版本':'请先暂停或停止项目'}">删除意见</button></li>`).join('')||'<li>暂无重规划意见</li>'}</ul></div>
+    <div class="card export-card"><h3>历史版本与成片审核</h3><p class="muted export-help">版本修改默认继承来源版本的镜头、顺序、转场、时长、BGM、字幕和马赛克，只改变意见明确指出的内容。马赛克与字幕仍使用各自快速流程；来源版本不会因生成新版本而自动删除。</p><ul>${p.exports.map((e,index)=>exportHtml(e,['stopped','paused'].includes(p.control?.desired_state),pendingRevisions[e.id]||0,pendingPrivacy[e.id]||0,pendingFullReplans[e.id]||0,index===0)).join('')||'<li>尚无输出</li>'}</ul><input id="export-caption-workbook-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden></div>
+    <div class="card"><h3>审核修改意见</h3><p class="muted">版本意见只作用于所选长篇或短篇，绝不会改动另一格式。项目通用意见会在下一次明确启动项目级重规划时分别生成两套方案。版本级意见默认增量修改，只有“完整重规划”会重写该格式时间线。</p>${buttonGuideHtml()}<div class="row replan-controls"><label>关联范围<select id="revision-target"><option value="">项目通用（长短篇分别规划）</option>${replanTargets.map(e=>`<option value="${e.id}">基于 ${esc(e.version)} · ${esc(formatNames[e.format]||e.format)}</option>`).join('')}</select></label><label>意见类型<select id="kind"><option value="edit">局部剪辑调整</option><option value="shot">指定镜头替换</option><option value="audio">音频精调</option><option value="duration">局部时长/章节</option><option value="style">局部风格/节奏</option><option value="privacy">马赛克校对</option><option value="full_replan">完整重规划（慎用）</option></select></label><button id="open-replan-dialog">填写修改意见</button></div><p id="revision-kind-help" class="revision-kind-help"></p><ul>${p.revisions.map(r=>`<li class="revision-item"><div class="revision-item-copy"><div class="revision-meta"><span class="revision-scope">${esc(revisionScopeLabel(r,p.exports))}</span><span class="revision-state">${esc(revisionStatusLabel(r))}</span></div><div class="revision-body"><b>${esc(r.kind)}</b> ${esc(r.body)}</div>${revisionIntentHtml(r.parsed_intent)}</div><button class="danger small" data-delete-revision="${r.id}" data-revision-status="${esc(r.status)}" ${canManageRevisions?'':'disabled'} title="${canManageRevisions?'删除该条修改意见；已完成的意见不会回滚现有方案或版本':'请先暂停或停止项目'}">删除意见</button></li>`).join('')||'<li>暂无修改意见</li>'}</ul></div>
     <div class="card log-card"><div class="log-title"><h3>运行日志</h3><div class="log-actions"><span id="log-refresh-meta" class="muted">每 60 秒自动刷新 · 最近 200 条</span><button id="refresh-logs" class="small">立即刷新</button></div></div><div id="project-logs" class="project-logs">${logsHtml(p.logs)}</div></div>
     <div class="card raw-card"><h3>原片清理</h3>${p.raw_deleted_at?`<p class="ok">原片已于 ${esc(new Date(p.raw_deleted_at).toLocaleString())} 永久删除；代理、字幕和成片仍保留。</p>`:`<p class="muted">长篇和短篇均“批准锁定”并停止项目后，才能立即删除 inbox 中本项目的原始视频。删除后无法重新剪辑原片。</p><button id="delete-raw" class="danger" ${rawDeleteReady?'':'disabled'}>审核完成并立即删除原片</button>`}</div>
     <details class="source-section"><summary>素材与代理预览 · ${p.assets.length} 个（仅供追溯）</summary><div class="card"><div class="asset-title"><h3>源素材识别结果</h3><div class="log-actions"><span id="asset-refresh-meta" class="muted">全素材完成后更新 · 可手动刷新</span><button id="refresh-assets" class="small">刷新素材</button></div></div><p class="muted asset-help">代理字幕仅用于追溯原始识别结果，不再作为人工终审入口。最终人工字幕审核请在上方各母版版本的“最终成片字幕”中完成。</p><div id="assets-list" class="assets"></div></div></details>
     <div class="card"><h3>四平台上传确认</h3><p class="muted">四项全部确认后立即清理临时渲染缓存，并开始原片/代理/音频等中间文件的14天保留期；批准成片从“批准/四平台确认”较晚时间起保留90天。已确认的平台可再次点击取消；取消不会恢复已经删除的文件。</p>${['youtube','bilibili','douyin','xiaohongshu'].map(x=>`<button data-upload="${x}" data-confirmed="${uploaded.has(x)}" class="${uploaded.has(x)?'confirmed':''}">${x} · ${uploaded.has(x)?'✓ 取消确认':'确认已上传'}</button>`).join('')}</div>
-    <dialog id="replan-dialog" class="confirm-dialog replan-dialog"><form method="dialog"><h3>填写重规划意见</h3><p id="replan-dialog-meta" class="muted"></p><textarea id="revision" placeholder="支持：5分19、07:04、镜头02替换、推荐加入、仅此段保留人声、保持23段镜头。"></textarea><div id="revision-intent-preview" class="revision-preview muted">提交前可先查看系统解析结果。</div><div class="confirm-dialog-actions"><button value="cancel">取消</button><button id="preview-revision" type="button">解析预览</button><button id="send" type="button">提交重规划意见</button></div></form></dialog><dialog id="delete-export-dialog" class="confirm-dialog"><form method="dialog"><div class="confirm-dialog-icon">!</div><h3>确认删除历史版本</h3><p id="delete-export-summary"></p><p class="warning-text">该版本的最终成片、字幕校对记录、无字幕剪辑母版和马赛克母版都会永久删除，无法恢复。原片、代理素材和其他版本不受影响。</p><div class="confirm-dialog-actions"><button value="cancel">取消</button><button id="confirm-delete-export" type="button" class="danger">确认永久删除</button></div></form></dialog>`;
+    <dialog id="replan-dialog" class="confirm-dialog replan-dialog"><form method="dialog"><h3>填写修改意见</h3><p id="replan-dialog-meta" class="muted"></p><textarea id="revision" placeholder="音频示例：BGM保持到2秒后出现人声再压低。镜头示例：镜头02替换为某素材20秒后。马赛克示例：22.1秒到22.8秒右侧人物加马赛克。"></textarea><div id="revision-intent-preview" class="revision-preview muted">提交前可先查看系统解析结果；默认沿用关联版本。</div><div class="confirm-dialog-actions"><button value="cancel">取消</button><button id="preview-revision" type="button">解析预览</button><button id="send" type="button">提交修改意见</button></div></form></dialog><dialog id="delete-export-dialog" class="confirm-dialog"><form method="dialog"><div class="confirm-dialog-icon">!</div><h3>确认删除历史版本</h3><p id="delete-export-summary"></p><p class="warning-text">该版本的最终成片、字幕校对记录、无字幕剪辑母版和隐私母版都会永久删除，无法恢复。原片、代理素材和其他版本不受影响。</p><div class="confirm-dialog-actions"><button value="cancel">取消</button><button id="confirm-delete-export" type="button" class="danger">确认永久删除</button></div></form></dialog>`;
   $('#mode').value=p.mode;
   $('#save').onclick=async()=>{try{await saveCurrentSettings(p);await show(p.id)}catch(e){alert(e.message)}};
   const replanDialog=$('#replan-dialog');
-  $('#open-replan-dialog').onclick=()=>{const target=$('#revision-target').selectedOptions[0]?.textContent||'项目级（不绑定版本）',kind=$('#kind').selectedOptions[0]?.textContent||'剪辑结构';$('#replan-dialog-meta').textContent=`关联：${target}　·　类型：${kind}`;$('#revision-intent-preview').className='revision-preview muted';$('#revision-intent-preview').textContent='提交前可先查看系统解析结果。';replanDialog.showModal();setTimeout(()=>$('#revision').focus(),0)};
+  const updateRevisionKindHelp=()=>{$('#revision-kind-help').textContent=revisionKindHelp[$('#kind').value]||''};updateRevisionKindHelp();$('#kind').onchange=updateRevisionKindHelp;
+  $('#open-replan-dialog').onclick=()=>{const target=$('#revision-target').selectedOptions[0]?.textContent||'项目通用（长短篇分别规划）',kind=$('#kind').selectedOptions[0]?.textContent||'剪辑结构';$('#replan-dialog-meta').textContent=`关联：${target}　·　类型：${kind}。${revisionKindHelp[$('#kind').value]||''}`;$('#revision-intent-preview').className='revision-preview muted';$('#revision-intent-preview').textContent='提交前可先查看系统解析结果。';replanDialog.showModal();setTimeout(()=>$('#revision').focus(),0)};
   const previewRevision=async()=>{if(!$('#revision').value.trim()){ $('#revision').focus();return }const sourceExportId=Number($('#revision-target').value)||null,result=await api(`/api/projects/${p.id}/revisions/preview`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:$('#kind').value,body:$('#revision').value.trim(),source_export_id:sourceExportId})});$('#revision-intent-preview').className='revision-preview';$('#revision-intent-preview').innerHTML=revisionIntentHtml(result)};
   $('#preview-revision').onclick=async()=>{try{await previewRevision()}catch(e){alert(e.message)}};
-  $('#send').onclick=async()=>{if(!$('#revision').value.trim()){ $('#revision').focus();return }try{const sourceExportId=Number($('#revision-target').value)||null;const result=await api(`/api/projects/${p.id}/revisions`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:$('#kind').value,body:$('#revision').value.trim(),source_export_id:sourceExportId})});replanDialog.close();alert(result.source_version?`意见已绑定到 ${result.source_version}，并已完成规则解析。随后点击该版本的“废弃并重规划”即可应用。`:'项目级意见已记录并完成解析；点击启动项目后将重新规划。');await show(p.id)}catch(e){alert(e.message)}};
+  $('#send').onclick=async()=>{if(!$('#revision').value.trim()){ $('#revision').focus();return }try{const sourceExportId=Number($('#revision-target').value)||null;const result=await api(`/api/projects/${p.id}/revisions`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:$('#kind').value,body:$('#revision').value.trim(),source_export_id:sourceExportId})});replanDialog.close();const next=result.waiting_for==='apply_privacy'?`随后点击 ${result.source_version} 的“应用马赛克意见”。`:result.source_version?`随后点击 ${result.source_version} 的“应用修改意见”。`:'点击启动项目后将更新项目级方案。';alert(`意见已记录并完成规则解析。${next}`);await show(p.id)}catch(e){alert(e.message)}};
   document.querySelectorAll('[data-delete-revision]').forEach(b=>b.onclick=async()=>{const completed=['applied','resolved'].includes(b.dataset.revisionStatus);const message=completed?'删除这条已完成的规划意见记录？\n\n不会回滚已经生成的剪辑方案或版本。':'删除这条待应用的规划意见？\n\n它将不再参与之后的重规划。';if(!confirm(message))return;try{await api(`/api/projects/${p.id}/revisions/${b.dataset.deleteRevision}`,{method:'DELETE'});await show(p.id)}catch(e){alert(e.message)}});
   document.querySelectorAll('[data-approve]').forEach(b=>b.onclick=async()=>{try{await api(`/api/exports/${b.dataset.approve}/approve`,{method:'POST'});await show(p.id)}catch(e){alert(e.message)}});
+  document.querySelectorAll('[data-unlock-export]').forEach(b=>b.onclick=async()=>{
+    if(!confirm(`取消 ${b.dataset.version} 的批准锁定？\n\n现有成片会保留并恢复为待最终审核；之后将重新允许生成该格式的新版本。`))return;
+    try{await api(`/api/exports/${b.dataset.unlockExport}/unlock`,{method:'POST'});await show(p.id)}catch(e){alert(e.message)}
+  });
   document.querySelectorAll('[data-export-version-captions]').forEach(b=>b.onclick=()=>{window.location.href=`/api/exports/${b.dataset.exportVersionCaptions}/captions.xlsx`});
   const exportCaptionInput=$('#export-caption-workbook-file');
   document.querySelectorAll('[data-import-version-captions]').forEach(b=>b.onclick=()=>{exportCaptionInput.dataset.exportId=b.dataset.importVersionCaptions;exportCaptionInput.dataset.version=b.dataset.version;exportCaptionInput.click()});
@@ -271,14 +318,25 @@ async function show(id){
     if(!confirm(`确认锁定 ${b.dataset.version} 当前字幕，并从马赛克母版快速生成最终成片吗？`))return;
     try{await api(`/api/exports/${b.dataset.lockCaptions}/captions/lock`,{method:'POST'});await show(p.id)}catch(e){alert(e.message)}
   });
+  document.querySelectorAll('[data-apply-privacy]').forEach(b=>b.onclick=async()=>{
+    const count=Number(b.dataset.privacyCount)||0;
+    if(!confirm(`将复用 ${b.dataset.version} 的无字幕剪辑母版，只按 ${count} 条人工意见生成普通马赛克快速版。\n\n剪辑、BGM、字幕和原版本不会改变。确定继续吗？`))return;
+    try{const result=await api(`/api/exports/${b.dataset.applyPrivacy}/privacy-revisions/apply`,{method:'POST'});alert(`已创建 ${result.version} 马赛克快速版，当前保持停止。需要时点击顶部对应格式按钮开始渲染。`);await show(p.id)}catch(e){alert(e.message)}
+  });
+
   document.querySelectorAll('[data-discard-master]').forEach(b=>b.onclick=async()=>{
     if(!confirm(`将删除 ${b.dataset.version} 当前无字幕剪辑母版和马赛克母版，并把同一版本重新加入渲染队列。\n\n时间线、字幕修正和版本号会保留；操作后需在顶部点击对应格式的渲染按钮。确定继续吗？`))return;
     try{const result=await api(`/api/exports/${b.dataset.discardMaster}/master/discard`,{method:'POST'});alert(`${b.dataset.version} 母版已废弃，释放约 ${(result.released_bytes/1073741824).toFixed(2)} GiB。请从顶部重新启动该格式渲染。`);await show(p.id)}catch(e){alert(e.message)}
   });
-  document.querySelectorAll('[data-discard-replan]').forEach(b=>b.onclick=async()=>{
-    const count=Number(b.dataset.revisionCount)||0;
-    if(!confirm(`将删除 ${b.dataset.version} 当前无字幕剪辑母版和马赛克母版，并在启动项目后只读取绑定到 ${b.dataset.version} 的 ${count} 条规划意见。\n\n系统会重写剪辑方案、创建一个新版本；当前版本的时间线与字幕校对不会迁移到新版本。确定继续吗？`))return;
-    try{const result=await api(`/api/exports/${b.dataset.discardReplan}/master/discard-and-replan`,{method:'POST'});alert(`${b.dataset.version} 母版已废弃，已绑定 ${result.revision_ids.length} 条意见。请点击“启动项目”开始重规划。`);await show(p.id)}catch(e){alert(e.message)}
+  document.querySelectorAll('[data-apply-revisions]').forEach(b=>b.onclick=async()=>{
+    const count=Number(b.dataset.revisionCount)||0,fullCount=Number(b.dataset.fullReplanCount)||0;
+    const message=fullCount?`你明确选择了“完整重规划”。系统将读取 ${count} 条意见并重写整条时间线。\n\n${b.dataset.version} 的原时间线和母版会保留用于回退；新方案需要再次启动渲染。确定执行完整重规划吗？`:`将严格继承 ${b.dataset.version} 的镜头、顺序、转场、总时长、BGM、字幕和马赛克，只应用 ${count} 条意见中明确指出的局部变化。\n\n来源版本会保留。确定创建增量新版本吗？`;
+    if(!confirm(message))return;
+    try{
+      const result=await api(`/api/exports/${b.dataset.applyRevisions}/revisions/apply`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm_full_replan:fullCount>0})});
+      alert(result.mode==='full_replan'?`${b.dataset.version} 已进入完整重规划等待状态，来源母版已保留。请点击“启动项目”生成新方案。`:`已基于 ${b.dataset.version} 创建 ${result.version}，只应用 ${result.operations.length} 项局部修改，当前保持停止。`);
+      await show(p.id)
+    }catch(e){alert(e.message)}
   });
   const deleteDialog=$('#delete-export-dialog'),deleteSummary=$('#delete-export-summary'),confirmDelete=$('#confirm-delete-export');
   document.querySelectorAll('[data-delete-export]').forEach(b=>b.onclick=()=>{deleteDialog.dataset.exportId=b.dataset.deleteExport;deleteDialog.dataset.version=b.dataset.version;deleteSummary.textContent=`即将删除 ${b.dataset.version} · ${b.dataset.format} · ${b.dataset.status}`;deleteDialog.showModal()});
@@ -287,7 +345,10 @@ async function show(id){
   if($('#refresh-logs'))$('#refresh-logs').onclick=()=>refreshLive(true);
   if($('#refresh-assets'))$('#refresh-assets').onclick=()=>refreshLive(true,'assets');
   if($('#delete-raw'))$('#delete-raw').onclick=async()=>{if(!confirm(`将永久删除 ${p.source_dir} 内本项目的 ${p.assets.length} 个原始视频。代理、字幕和已批准成片保留。此操作无法撤销，确定继续吗？`))return;try{const result=await api(`/api/projects/${p.id}/raw/delete`,{method:'POST'});alert(`已删除 ${result.deleted_files} 个原片，释放约 ${(result.deleted_bytes/1073741824).toFixed(1)} GiB`);await show(p.id)}catch(e){alert(e.message)}};
-  refreshAssetList(p.assets,true);allAssetCaptionsComplete=captionsComplete(p.assets);wireControls(p);await loadVersionCaptionSummaries();await load();
+  refreshAssetList(p.assets,true);allAssetCaptionsComplete=captionsComplete(p.assets);wireControls(p);await loadVersionCaptionSummaries();
+  const latest=p.exports[0],waitingForReview=latest&&['caption_review_ready','review_ready','approved'].includes(latest.status);
+  if(revealLatest&&waitingForReview)requestAnimationFrame(()=>document.querySelector(`#export-version-${latest.id}`)?.scrollIntoView({block:'start'}));
+  await load();
 }
 
 async function refreshLive(manual=false,source='logs'){

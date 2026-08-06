@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .config import FACE_MODELS,OWNER_IDENTITY,PRIVACY_AVATAR
+from .config import FACE_MODELS,OWNER_IDENTITY
 
 DETECTOR_MODEL=FACE_MODELS/"face_detection_yunet_2023mar.onnx"
 RECOGNIZER_MODEL=FACE_MODELS/"face_recognition_sface_2021dec.onnx"
@@ -22,16 +22,21 @@ STATIC_FACE_MOTION=float(os.getenv("PRIVACY_STATIC_FACE_MOTION","1.8"))
 AUTOMATIC_FACE_SCORE=float(os.getenv("PRIVACY_AUTOMATIC_FACE_SCORE","0.70"))
 MIN_PRIMARY_FACE_HEIGHT_RATIO=float(os.getenv("PRIVACY_MIN_PRIMARY_FACE_HEIGHT_RATIO","0.055"))
 MIN_PRIMARY_FACE_WIDTH_RATIO=float(os.getenv("PRIVACY_MIN_PRIMARY_FACE_WIDTH_RATIO","0.025"))
+MOSAIC_BLOCK_SIZE=int(os.getenv("PRIVACY_MOSAIC_BLOCK_SIZE","18"))
 OWNER_REFERENCE_PATTERNS=("reference-*","profile-*","scene-left-*")
 OWNER_REFERENCE_EXTENSIONS={".jpg",".jpeg",".png",".webp"}
 
-def privacy_enabled(settings):
+def automatic_privacy_enabled(settings):
     privacy=(settings or {}).get("privacy") if isinstance(settings,dict) else None
     if isinstance(privacy,dict) and "cover_non_owner_faces" in privacy:
         return bool(privacy["cover_non_owner_faces"])
     if isinstance(privacy,dict) and "blur_non_owner_faces" in privacy:
         return bool(privacy["blur_non_owner_faces"])
-    return True
+    return False
+
+def privacy_enabled(settings,manual_rules=None):
+    force_cover=(manual_rules or {}).get("force_cover",[]) if isinstance(manual_rules,dict) else []
+    return automatic_privacy_enabled(settings) or bool(force_cover)
 
 def _identity_reference_files():
     return sorted({path for pattern in OWNER_REFERENCE_PATTERNS for path in OWNER_IDENTITY.glob(pattern) if path.suffix.lower() in OWNER_REFERENCE_EXTENSIONS})
@@ -102,12 +107,15 @@ def _face_patch(image,face):
     region=image[y1:y2,x1:x2]
     return cv2.resize(cv2.cvtColor(region,cv2.COLOR_BGR2GRAY),(48,48),interpolation=cv2.INTER_AREA)
 
-def _overlay_avatar(image,face,avatar):
-    height,width=image.shape[:2];x,y,w,h=[float(value) for value in face[:4]];size=max(24,int(max(w*1.55,h*1.40)));cx=int(x+w/2);cy=int(y+h/2);desired_x1=cx-size//2;desired_y1=cy-size//2;desired_x2=desired_x1+size;desired_y2=desired_y1+size;x1=max(0,desired_x1);y1=max(0,desired_y1);x2=min(width,desired_x2);y2=min(height,desired_y2)
+def _pixelate_face(image,face):
+    height,width=image.shape[:2];x,y,w,h=[float(value) for value in face[:4]]
+    desired_x1=int(x-w*0.24);desired_y1=int(y-h*0.28);desired_x2=int(x+w*1.24);desired_y2=int(y+h*1.30)
+    x1=max(0,desired_x1);y1=max(0,desired_y1);x2=min(width,desired_x2);y2=min(height,desired_y2)
     if x2<=x1 or y2<=y1:return
-    sticker=cv2.resize(avatar,(size,size),interpolation=cv2.INTER_AREA);sx=x1-desired_x1;sy=y1-desired_y1;sticker=sticker[sy:sy+(y2-y1),sx:sx+(x2-x1)]
-    mask=np.zeros((size,size),dtype=np.uint8);cv2.circle(mask,(size//2,size//2),size//2-1,255,-1,lineType=cv2.LINE_AA);mask=mask[sy:sy+(y2-y1),sx:sx+(x2-x1)];alpha=(mask.astype(np.float32)/255.0)[...,None]
-    image[y1:y2,x1:x2]=(sticker.astype(np.float32)*alpha+image[y1:y2,x1:x2].astype(np.float32)*(1-alpha)).astype(np.uint8)
+    region=image[y1:y2,x1:x2];block=max(4,MOSAIC_BLOCK_SIZE)
+    small_width=max(1,(x2-x1)//block);small_height=max(1,(y2-y1)//block)
+    mosaic=cv2.resize(region,(small_width,small_height),interpolation=cv2.INTER_AREA)
+    image[y1:y2,x1:x2]=cv2.resize(mosaic,(x2-x1,y2-y1),interpolation=cv2.INTER_NEAREST)
 
 def _tracking_score(face,prior):
     iou=OwnerFaceMatcher._iou(face,prior);ax,ay,aw,ah=[float(value) for value in face[:4]];bx,by,bw,bh=[float(value) for value in prior[:4]];distance=((ax+aw/2-bx-bw/2)**2+(ay+ah/2-by-bh/2)**2)**0.5/max(aw,ah,bw,bh,1.0)
@@ -187,9 +195,8 @@ def inspect_image(path,matcher=None):
         results.append({"box":[round(float(value),1) for value in face[:4]],"score":round(score,4),"detection_score":round(float(face[14]),4),"plausible":plausible,"primary":primary,"owner":plausible and score>=OWNER_THRESHOLD})
     return results
 
-def anonymize_video(source,checkpoint=None,progress=None,manual_rules=None):
-    source=Path(source);matcher=OwnerFaceMatcher();avatar=cv2.imread(str(PRIVACY_AVATAR));capture=cv2.VideoCapture(str(source))
-    if avatar is None:raise RuntimeError(f"无法读取隐私遮挡头像：{PRIVACY_AVATAR}")
+def anonymize_video(source,checkpoint=None,progress=None,manual_rules=None,automatic=False):
+    source=Path(source);matcher=OwnerFaceMatcher();capture=cv2.VideoCapture(str(source))
     if not capture.isOpened():raise RuntimeError(f"无法打开待打码视频：{source}")
     width=int(capture.get(cv2.CAP_PROP_FRAME_WIDTH));height=int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT));fps=float(capture.get(cv2.CAP_PROP_FPS) or 30);total=int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     temporary=source.with_name(source.stem+".privacy.tmp.mp4");log_path=source.with_name(source.stem+".privacy.ffmpeg.log")
@@ -206,7 +213,7 @@ def anonymize_video(source,checkpoint=None,progress=None,manual_rules=None):
                         for track in tracks.values():
                             if _track_covers_frame(track,frame_index):
                                 box=_track_box(track,frame_index);seconds=frame_index/max(fps,1)
-                                if not _matching_rule(manual_rules,"suppress",seconds,box,width,height):_overlay_avatar(output,box,avatar)
+                                if not _matching_rule(manual_rules,"suppress",seconds,box,width,height):_pixelate_face(output,box)
                         process.stdin.write(output.tobytes());written+=1
                         next_buffer_index=buffer[0][0] if buffer else frame_index+1
                         expired=[track_id for track_id,track in tracks.items() if next_buffer_index>track["last"]+TRACK_TAIL_FRAMES and frames-track["last"]>TRACK_TAIL_FRAMES]
@@ -221,6 +228,7 @@ def anonymize_video(source,checkpoint=None,progress=None,manual_rules=None):
                         force_rule=_matching_rule(manual_rules,"force_cover",seconds,face,width,height)
                         owner_rule=_matching_rule(manual_rules,"force_owner",seconds,face,width,height)
                         if _matching_rule(manual_rules,"suppress",seconds,face,width,height):suppressed_manual_faces+=1;continue
+                        if not automatic and not force_rule and not owner_rule:continue
                         if not force_rule and not owner_rule and not _plausible_face(face):suppressed_invalid_faces+=1;continue
                         if not force_rule and not owner_rule and not _primary_face(face,width,height):suppressed_distant_faces+=1;continue
                         detected.append((face,force_rule,owner_rule))
@@ -239,7 +247,7 @@ def anonymize_video(source,checkpoint=None,progress=None,manual_rules=None):
                         if force_rule:
                             track["manual_cover"]=True;track["owner"]=False;track["confirmed"]=True
                             for key,default in (("lead_frames",TRACK_LEAD_FRAMES),("tail_frames",TRACK_TAIL_FRAMES),("max_gap_frames",TRACK_TAIL_FRAMES+2)):
-                                try:track[key]=max(int(track.get(key,default)),int(force_rule.get(key,default)))
+                                try:track[key]=max(0,int(force_rule.get(key,track.get(key,default))))
                                 except (TypeError,ValueError):pass
                             manual_covered_faces+=1
                         elif owner_rule:
@@ -269,7 +277,7 @@ def anonymize_video(source,checkpoint=None,progress=None,manual_rules=None):
                 raise
         if not temporary.is_file() or temporary.stat().st_size<=0:raise RuntimeError("人脸隐私处理没有生成有效视频")
         temporary.replace(source);log_path.unlink(missing_ok=True)
-        return {"frames":frames,"owner_faces":owner_faces,"avatar_covered_faces":covered_faces,"manual_covered_faces":manual_covered_faces,"manual_owner_faces":manual_owner_faces,"suppressed_invalid_faces":suppressed_invalid_faces,"suppressed_distant_faces":suppressed_distant_faces,"suppressed_manual_faces":suppressed_manual_faces,"suppressed_static_tracks":suppressed_static_tracks,"owner_reference_count":len(matcher.reference_names),"owner_reference_files":matcher.reference_names,"owner_threshold":OWNER_THRESHOLD,"automatic_face_score":AUTOMATIC_FACE_SCORE,"min_primary_face_height_ratio":MIN_PRIMARY_FACE_HEIGHT_RATIO,"min_primary_face_width_ratio":MIN_PRIMARY_FACE_WIDTH_RATIO,"lead_frames":TRACK_LEAD_FRAMES,"tail_frames":TRACK_TAIL_FRAMES,"static_motion_threshold":STATIC_FACE_MOTION}
+        return {"frames":frames,"owner_faces":owner_faces,"mosaic_covered_faces":covered_faces,"manual_covered_faces":manual_covered_faces,"manual_owner_faces":manual_owner_faces,"suppressed_invalid_faces":suppressed_invalid_faces,"suppressed_distant_faces":suppressed_distant_faces,"suppressed_manual_faces":suppressed_manual_faces,"suppressed_static_tracks":suppressed_static_tracks,"owner_reference_count":len(matcher.reference_names),"owner_reference_files":matcher.reference_names,"owner_threshold":OWNER_THRESHOLD,"automatic_privacy":bool(automatic),"automatic_face_score":AUTOMATIC_FACE_SCORE,"min_primary_face_height_ratio":MIN_PRIMARY_FACE_HEIGHT_RATIO,"min_primary_face_width_ratio":MIN_PRIMARY_FACE_WIDTH_RATIO,"mosaic_block_size":MOSAIC_BLOCK_SIZE,"lead_frames":TRACK_LEAD_FRAMES,"tail_frames":TRACK_TAIL_FRAMES,"static_motion_threshold":STATIC_FACE_MOTION}
     except Exception as exc:
         temporary.unlink(missing_ok=True)
         if isinstance(exc,RuntimeError) and log_path.exists():

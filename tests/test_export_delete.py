@@ -33,5 +33,29 @@ class ExportDeleteTest(IsolatedDbTestCase):
         log=db.row("SELECT event,message FROM project_logs WHERE project_id=? ORDER BY id DESC LIMIT 1",(self.project_id,))
         self.assertEqual("export_deleted",log["event"]);self.assertIn("v9",log["message"])
 
+    def test_deleting_last_pending_export_clears_stale_resume_state(self):
+        db.execute("DELETE FROM exports WHERE id=?",(self.export_id,))
+        approved_id=db.execute(
+            "INSERT INTO exports(project_id,version,format,path,status,locked,created_at) VALUES(?,?,?,?,?,?,?)",
+            (self.project_id,"v8","short_9x16",json.dumps(["/vlog/outputs/v8.mp4"]),"approved",1,db.now()),
+        )
+        pending_id=db.execute(
+            "INSERT INTO exports(project_id,version,format,status,created_at) VALUES(?,?,?,?,?)",
+            (self.project_id,"v10","short_9x16","render_requested",db.now()),
+        )
+        db.execute("UPDATE projects SET status='render_requested' WHERE id=?",(self.project_id,))
+        db.create_control(self.project_id,"stopped","render_requested","成片渲染","v10 等待渲染",render_scope="short_9x16")
+
+        main.delete_export(pending_id)
+
+        self.assertIsNotNone(db.row("SELECT id FROM exports WHERE id=?",(approved_id,)))
+        self.assertEqual("review_ready",db.row("SELECT status FROM projects WHERE id=?",(self.project_id,))["status"])
+        control=db.control(self.project_id)
+        self.assertEqual("stopped",control["desired_state"])
+        self.assertIsNone(control["resume_status"])
+        self.assertIsNone(control["render_scope"])
+        self.assertEqual("人工审核",control["stage"])
+        self.assertEqual("没有待渲染版本",control["item"])
+
 
 if __name__=="__main__":unittest.main()

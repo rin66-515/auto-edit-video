@@ -9,7 +9,7 @@ from pathlib import Path
 from . import db
 from .config import INBOX,PROJECTS,PROXIES,AUDIO,OUTPUTS,MUSIC,VIDEO_EXTENSIONS,SCAN_SECONDS,STABLE_SECONDS,MIN_FREE_GIB,RAW_RETENTION_DAYS,FINAL_RETENTION_DAYS
 from .media import apply_text_overlays,burn_subtitles,probe,create_derivatives,render_timeline,trim_after_final_black,write_bilingual_srt
-from .privacy import anonymize_video,privacy_enabled
+from .privacy import anonymize_video,automatic_privacy_enabled,privacy_enabled
 
 FOLDER_STATE={}
 SCAN_LOCK=threading.Lock()
@@ -207,6 +207,15 @@ def render_once():
         project_settings=json.loads(export.get('settings') or '{}');plan=project_settings.get('story_plan',{});assets=db.rows("SELECT * FROM assets WHERE project_id=? ORDER BY id",(export['project_id'],));masterdir=PROJECTS/export['slug']/"masters"/str(export["id"]);manifest_outputs=[]
         try:render_options=json.loads(export.get('render_options') or '{}')
         except json.JSONDecodeError:render_options={}
+        privacy_only=export.get("render_mode")=="privacy_only"
+        source_outputs={}
+        if privacy_only:
+            source=db.row("SELECT master_manifest FROM exports WHERE id=? AND project_id=?",(export.get("source_export_id"),export["project_id"]))
+            if not source:raise RuntimeError("隐私快速版找不到来源版本")
+            try:source_manifest=json.loads(source.get("master_manifest") or "{}")
+            except json.JSONDecodeError:source_manifest={}
+            source_outputs={str(value.get("name") or ""):value for value in source_manifest.get("outputs",[]) if isinstance(value,dict)}
+            if not source_outputs:raise RuntimeError("来源版本没有可复用的无字幕剪辑母版")
         try:snapshot=json.loads(export.get('timeline_snapshot') or '{}')
         except json.JSONDecodeError:snapshot={}
         if not snapshot:snapshot={"long":plan.get('long',{}).get('timeline',[])} if export['format']=='long_16x9' else {f"short-{i+1}":x.get('timeline',[]) for i,x in enumerate(plan.get('shorts',[])) if isinstance(x,dict)}
@@ -241,17 +250,26 @@ def render_once():
             db.set_progress(export['project_id'],"render_requested",stage,render_summary(f"正在渲染 {export['version']} · {name}"))
             db.log_event(export['project_id'],"info",stage,"output_started",render_summary(f"开始渲染 {export['version']} · {name}"),{"long_done":long_done,"long_total":long_total,"short_done":short_done,"short_total":short_total,"version":export['version'],"output":name})
             edit_master=masterdir/f"{name}.edit-master.mp4";privacy_master=masterdir/f"{name}.privacy-master.mp4"
-            render_timeline(assets,timeline,export['format'],edit_master,PROJECTS/export['slug']/"render-temp"/f"{export['id']}-{name}",music,render_checkpoint,caption_overrides,name,burn_captions=False)
+            if privacy_only:
+                source_item=source_outputs.get(name) or {}
+                source_edit=Path(str(source_item.get("edit") or "")).resolve()
+                if not source_edit.is_relative_to(PROJECTS.resolve()) or not source_edit.is_file():raise RuntimeError(f"来源版本的无字幕剪辑母版不存在：{name}")
+                edit_master.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source_edit,edit_master)
+                db.log_event(export['project_id'],"info","人工马赛克校对","edit_master_reused",f"已复用来源版本剪辑母版：{name}",{"source_edit":str(source_edit),"target_edit":str(edit_master)})
+            else:
+                render_timeline(assets,timeline,export['format'],edit_master,PROJECTS/export['slug']/"render-temp"/f"{export['id']}-{name}",music,render_checkpoint,caption_overrides,name,burn_captions=False,mix_options=render_options)
             text_overlays=render_options.get("text_overlays") if isinstance(render_options,dict) else None
-            if text_overlays:
+            if text_overlays and not privacy_only:
                 overlay_stats=apply_text_overlays(edit_master,text_overlays);db.log_event(export['project_id'],"success","动态文字","text_overlays_completed",f"已为 {edit_master.name} 加入 {overlay_stats['applied']} 处动态文字",overlay_stats)
             black_trim=render_options.get("final_black_trim") if isinstance(render_options,dict) else None
-            if isinstance(black_trim,dict) and black_trim.get("enabled"):
+            if not privacy_only and isinstance(black_trim,dict) and black_trim.get("enabled"):
                 trim_stats=trim_after_final_black(edit_master,black_trim.get("search_seconds",5.0))
                 db.log_event(export['project_id'],"success" if trim_stats.get("trimmed") else "info","成片收尾","final_black_trimmed",f"已在最后黑屏处收尾：{edit_master.name}" if trim_stats.get("trimmed") else f"结尾未发现需要删除的黑屏后回闪：{edit_master.name}",trim_stats)
             privacy_master.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(edit_master,privacy_master)
-            if privacy_enabled(project_settings):
-                privacy_stage="人脸隐私处理";db.log_event(export['project_id'],"info",privacy_stage,"privacy_started",f"开始仅保留本人、用指定头像遮挡其他真实人脸：{privacy_master.name}")
+            privacy_rules=render_options.get("privacy_rules") if isinstance(render_options,dict) else None
+            automatic_privacy=automatic_privacy_enabled(project_settings)
+            if privacy_enabled(project_settings,privacy_rules):
+                privacy_stage="人脸隐私处理";db.log_event(export['project_id'],"info",privacy_stage,"privacy_started",f"开始按人工意见添加普通马赛克：{privacy_master.name}" if not automatic_privacy else f"开始自动识别人脸并添加普通马赛克：{privacy_master.name}")
                 last_privacy_heartbeat=[time.monotonic()]
                 def privacy_checkpoint(frames,total):
                     percent=round(frames/max(total,1)*100,1) if total else 0
@@ -265,9 +283,8 @@ def render_once():
                     now=time.monotonic()
                     if now-last_privacy_heartbeat[0]<600:return
                     last_privacy_heartbeat[0]=now;percent=round(frames/max(total,1)*100,1) if total else 0
-                    db.log_event(export['project_id'],"info",privacy_stage,"privacy_heartbeat",f"头像人脸遮挡仍在运行：{privacy_master.name} · {percent}%",{"frames":frames,"total_frames":total,"owner_faces":owner_faces,"avatar_covered_faces":covered_faces})
-                privacy_rules=render_options.get("privacy_rules") if isinstance(render_options,dict) else None
-                stats=anonymize_video(privacy_master,checkpoint=privacy_checkpoint,progress=privacy_progress,manual_rules=privacy_rules)
+                    db.log_event(export['project_id'],"info",privacy_stage,"privacy_heartbeat",f"普通马赛克处理仍在运行：{privacy_master.name} · {percent}%",{"frames":frames,"total_frames":total,"owner_faces":owner_faces,"mosaic_covered_faces":covered_faces})
+                stats=anonymize_video(privacy_master,checkpoint=privacy_checkpoint,progress=privacy_progress,manual_rules=privacy_rules,automatic=automatic_privacy)
                 db.log_event(export['project_id'],"success",privacy_stage,"privacy_completed",f"人脸隐私处理完成：{privacy_master.name}",stats)
             manifest_outputs.append({"name":name,"edit":str(edit_master),"privacy":str(privacy_master)})
             if name=='long':long_done=1

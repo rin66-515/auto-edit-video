@@ -38,7 +38,7 @@ def timeline_stats(timeline,assets):
         duration=_duration(asset)
         if start<0 or end<=start or end>duration+0.05:
             errors.append(f"第{index}项asset_id={asset_id}越界：start={start}, end={end}, duration={duration:.2f}");continue
-        if item.get("audio_mode") not in {"dialogue","ambient","montage","mute"}:errors.append(f"第{index}项缺少有效audio_mode")
+        if item.get("audio_mode") not in {"dialogue","ambient","montage","mute","denoise"}:errors.append(f"第{index}项缺少有效audio_mode")
         intervals.setdefault(asset_id,[]).append((start,end,index));total+=end-start
     for asset_id,values in intervals.items():
         values.sort()
@@ -130,8 +130,70 @@ def _asset_preferences(intent):
     return priorities,chapters
 
 
+def _bounded_number(value,default=50.0):
+    try:return max(0.0,min(100.0,float(value)))
+    except (TypeError,ValueError):return default
+
+
+def _long_asset_profile(asset,priorities,anchor_ids):
+    asset_id=int(asset["id"]);visual=_analysis(asset).get("visual") or {}
+    story=_bounded_number(visual.get("story_value"));quality=_bounded_number(visual.get("quality"))
+    priority=_bounded_number(priorities.get(asset_id,50));caption_signal=min(len(_captions(asset)),20)/20*100
+    problems=visual.get("problems") if isinstance(visual.get("problems"),list) else []
+    suggested_use=str(visual.get("suggested_use") or "").strip()
+    duplicate=bool(visual.get("duplicate_hint"))
+    score=0.40*story+0.30*quality+0.15*priority+0.10*caption_signal-min(len(problems),4)*2
+    if asset_id in anchor_ids:score+=15
+    if duplicate:score-=25
+    if suggested_use=="弃用":score-=80
+    if asset_id in anchor_ids:tier=0
+    elif suggested_use=="弃用":tier=3
+    elif duplicate:tier=2
+    elif score>=50:tier=0
+    elif score>=35:tier=1
+    else:tier=2
+    return {
+        "asset_id":asset_id,
+        "score":round(score,4),
+        "tier":tier,
+        "suggested_use":suggested_use,
+        "duplicate":duplicate,
+    }
+
+
+def _long_asset_caps(assets,anchor_ids,target):
+    caps={int(asset["id"]):min(_duration(asset),420.0 if int(asset["id"]) in anchor_ids else 360.0) for asset in assets}
+    if sum(caps.values())<target:caps={int(asset["id"]):_duration(asset) for asset in assets}
+    return caps
+
+
 def _recommended_long_target(intent,assets,anchor_ids):
-    available=sum(_duration(asset) for asset in assets);priorities,_=_asset_preferences(intent);useful=0.0
+    available=sum(_duration(asset) for asset in assets)
+    constraint=intent.get("long_duration_constraint") if isinstance(intent.get("long_duration_constraint"),dict) else None
+    if constraint:
+        try:
+            minimum=max(600.0,float(constraint.get("min_minutes"))*60)
+            maximum=min(3600.0,float(constraint.get("max_minutes"))*60)
+            preferred=float(constraint.get("preferred_minutes"))*60
+        except (TypeError,ValueError):
+            minimum=maximum=preferred=0.0
+        feasible_max=min(3600.0,available*0.92)
+        if minimum>0:
+            if maximum<minimum:minimum,maximum=maximum,minimum
+            maximum=min(maximum,feasible_max)
+            if maximum<minimum-0.05:
+                raise RuntimeError(f"人工要求长篇至少{minimum/60:.1f}分钟，但当前素材最多可安全编排{feasible_max/60:.1f}分钟")
+            preferred=max(minimum,min(maximum,preferred))
+            priorities,_=_asset_preferences(intent);caps=_long_asset_caps(assets,anchor_ids,preferred)
+            preferred_quality_capacity=sum(
+                caps[int(asset["id"])]
+                for asset in assets
+                if _long_asset_profile(asset,priorities,anchor_ids)["tier"]==0
+            )
+            if preferred_quality_capacity>=preferred:return preferred
+            if preferred_quality_capacity>=minimum:return min(maximum,preferred_quality_capacity)
+            return minimum
+    priorities,_=_asset_preferences(intent);useful=0.0
     for asset in assets:
         asset_id=int(asset["id"]);analysis=_analysis(asset);visual=analysis.get("visual") or {}
         try:story=max(0.0,min(100.0,float(visual.get("story_value") or 50)))/100
@@ -152,15 +214,32 @@ def _recommended_long_target(intent,assets,anchor_ids):
 
 
 def _allocate_budgets(assets,target,intent,anchor_ids):
-    priorities,_=_asset_preferences(intent);allocations={int(asset["id"]):0.0 for asset in assets};caps={int(asset["id"]):min(_duration(asset),420.0 if int(asset["id"]) in anchor_ids else 360.0) for asset in assets}
-    if sum(caps.values())<target:caps={int(asset["id"]):_duration(asset) for asset in assets}
-    weights={}
-    for asset in assets:
-        asset_id=int(asset["id"]);analysis=_analysis(asset);visual=analysis.get("visual") or {};caption_count=len(_captions(asset));story=float(visual.get("story_value") or 50);priority=priorities.get(asset_id,50)
-        weights[asset_id]=1.0+story/100+min(caption_count,30)/12+priority/100+(0.8 if asset_id in anchor_ids else 0)
+    priorities,_=_asset_preferences(intent);allocations={int(asset["id"]):0.0 for asset in assets}
+    caps=_long_asset_caps(assets,anchor_ids,target)
+    profiles={int(asset["id"]):_long_asset_profile(asset,priorities,anchor_ids) for asset in assets}
+    ranked=sorted(
+        assets,
+        key=lambda asset:(
+            profiles[int(asset["id"])]["tier"],
+            -profiles[int(asset["id"])]["score"],
+            int(asset["id"]),
+        ),
+    )
+    selected=set(int(value) for value in anchor_ids if int(value) in allocations)
+    selected_capacity=sum(caps[asset_id] for asset_id in selected)
+    for asset in ranked:
+        if selected_capacity>=target-0.05:break
+        asset_id=int(asset["id"])
+        if asset_id in selected:continue
+        selected.add(asset_id);selected_capacity+=caps[asset_id]
+    if selected_capacity<target-0.05:raise RuntimeError("素材可用区间不足，无法达到长篇目标时长")
+    weights={
+        asset_id:max(0.2,1.0+profiles[asset_id]["score"]/50)
+        for asset_id in selected
+    }
     remaining=target
     for _ in range(20):
-        active=[asset_id for asset_id in allocations if caps[asset_id]-allocations[asset_id]>1e-6]
+        active=[asset_id for asset_id in selected if caps[asset_id]-allocations[asset_id]>1e-6]
         if remaining<=1e-5:break
         if not active:raise RuntimeError("素材可用区间不足，无法达到长篇目标时长")
         weight_sum=sum(weights[asset_id] for asset_id in active);added=0.0
@@ -170,7 +249,15 @@ def _allocate_budgets(assets,target,intent,anchor_ids):
         remaining-=added
         if added<=1e-6:break
     if remaining>0.1:raise RuntimeError("无法分配足够的非重复素材区间")
-    return allocations
+    ordered_selected=[int(asset["id"]) for asset in assets if int(asset["id"]) in selected]
+    return allocations,{
+        "selection_policy":"quality_tiered_chronological_v1",
+        "selected_asset_count":len(ordered_selected),
+        "available_asset_count":len(assets),
+        "selected_asset_ids":ordered_selected,
+        "fallback_asset_count":sum(1 for asset_id in selected if profiles[asset_id]["tier"]>0),
+        "quality_floor_score":round(min(profiles[asset_id]["score"] for asset_id in selected),2) if selected else None,
+    }
 
 
 def _caption_ranges(asset):
@@ -190,6 +277,18 @@ def _distributed_segments(asset,budget,chapter):
         start=first+index*(length+gap) if count>1 else first;end=min(duration,start+length);dialogue=any(start<caption_end and end>caption_start for caption_start,caption_end in ranges)
         result.append({"asset_id":int(asset["id"]),"start":round(start,3),"end":round(end,3),"chapter":chapter,"reason":"保留真实对话与朋友互动" if dialogue else "交代移动、街景、饮食或现场细节","audio_mode":"dialogue" if dialogue else "montage"})
     return result
+
+
+def build_short_source_pool(assets,target_seconds=None):
+    """Create a short-form candidate pool directly from every usable source asset."""
+    usable=[asset for asset in assets if _duration(asset)>=0.4];pool=[]
+    requested=max(0.0,float(target_seconds or 0))
+    per_asset=max(18.0,requested*1.35/max(1,len(usable))) if requested else 18.0
+    for asset in usable:
+        duration=_duration(asset)
+        budget=min(duration,max(0.4,per_asset))
+        pool.extend(_distributed_segments(asset,budget,"短篇独立候选"))
+    return pool
 
 
 def _fallback_shorts(assets,anchor_ids,context):
@@ -529,12 +628,7 @@ def manual_short_reselection(revisions,assets,style_seed=None,target_seconds=Non
     return short
 
 def rebuild_short_plans(existing_shorts,long_timeline,assets,style_seed,target_seconds=None,max_outputs=1,bgm_led=False,rhythm_marks=None):
-    """Rebuild short edits from an already approved/revised long timeline.
-
-    The selected source-video set comes from each prior short, while every actual
-    time range is reselected from ``long_timeline``. This keeps manual removals
-    (smoking, phone operation, etc.) out of subsequent short versions.
-    """
+    """Rebuild short edits from all source assets, independently of the long edit."""
     assets_by_id={int(asset["id"]):asset for asset in assets};valid=set(assets_by_id);definitions=[]
     for index,short in enumerate(existing_shorts or [],1):
         if not isinstance(short,dict):continue
@@ -546,7 +640,9 @@ def rebuild_short_plans(existing_shorts,long_timeline,assets,style_seed,target_s
         definition={key:short.get(key) for key in ("title","hook","cover_text","core_payoff","pacing","voice_mode","voice_reason") if short.get(key)};definition["asset_ids"]=asset_ids;definitions.append(definition)
         if len(definitions)>=max(1,min(3,int(max_outputs or 1))):break
     if not definitions:raise RuntimeError("没有可复用的短篇方案，不能安全重建短篇版本")
-    shorts=[_build_short(definition,long_timeline,index,assets_by_id,style_seed,target_seconds,bgm_led,rhythm_marks) for index,definition in enumerate(definitions,1)]
+    source_pool=build_short_source_pool(assets,target_seconds)
+    if not source_pool:raise RuntimeError("全部素材中没有可供短篇独立选材的有效片段")
+    shorts=[_build_short(definition,source_pool,index,assets_by_id,style_seed,target_seconds,bgm_led,rhythm_marks) for index,definition in enumerate(definitions,1)]
     for index,short in enumerate(shorts,1):
         _,errors=timeline_stats(short["timeline"],assets);seconds=_effective_short_seconds(short["timeline"])
         if errors or not 10<=seconds<=600.05:raise RuntimeError(f"短篇{index}时间线校验失败："+"；".join(errors or [f"有效时长{seconds:.1f}秒"]))
@@ -556,7 +652,7 @@ def rebuild_short_plans(existing_shorts,long_timeline,assets,style_seed,target_s
 def assemble_story_plan(intent,assets,context="",used_fallback=False):
     intent=intent if isinstance(intent,dict) else {};usable=[asset for asset in assets if _duration(asset)>=0.4];available=sum(_duration(asset) for asset in usable)
     if available<600:raise RuntimeError(f"素材总时长仅{available:.1f}秒，不足以制作10分钟长篇")
-    chapters=_chapter_names(intent,context);anchor_ids=_anchor_ids(intent,usable,context);target=_recommended_long_target(intent,usable,anchor_ids);allocations=_allocate_budgets(usable,target,intent,anchor_ids);_,chapter_preferences=_asset_preferences(intent);timeline=[]
+    chapters=_chapter_names(intent,context);anchor_ids=_anchor_ids(intent,usable,context);target=_recommended_long_target(intent,usable,anchor_ids);allocations,selection=_allocate_budgets(usable,target,intent,anchor_ids);_,chapter_preferences=_asset_preferences(intent);timeline=[]
     for position,asset in enumerate(usable):
         default_chapter=chapters[min(len(chapters)-1,int(position*len(chapters)/max(1,len(usable))))];chapter=chapter_preferences.get(int(asset["id"]),default_chapter)
         if chapter not in chapters:chapter=default_chapter
@@ -564,9 +660,9 @@ def assemble_story_plan(intent,assets,context="",used_fallback=False):
     for chapter in chapters:
         candidate=next((item for item in timeline if item["chapter"]==chapter and item["audio_mode"]=="montage"),None)
         if candidate:candidate["audio_mode"]="ambient"
-    style_seed=intent.get("short_style_seed");assets_by_id={int(asset["id"]):asset for asset in usable};shorts=[_build_short(definition,timeline,index,assets_by_id,style_seed) for index,definition in enumerate(_short_definitions(intent,usable,anchor_ids,context),1)]
+    style_seed=intent.get("short_style_seed");assets_by_id={int(asset["id"]):asset for asset in usable};short_pool=build_short_source_pool(usable);shorts=[_build_short(definition,short_pool,index,assets_by_id,style_seed) for index,definition in enumerate(_short_definitions(intent,usable,anchor_ids,context),1)]
     anchor=intent.get("story_anchor") if isinstance(intent.get("story_anchor"),dict) else {}
-    plan={"title":str(intent.get("title") or ("黄金周的东京散步" if "黄金周" in context else "一日生活记录")),"summary":str(intent.get("summary") or "以真实移动、街景、饮食和朋友交流串起当天经历。"),"long":{"target_seconds":round(target,1),"selection_ratio":round(target/available,4),"story_anchor":{"topic":str(anchor.get("topic") or ("中日数字手势的差异" if "手势" in context else "朋友交流中的意外发现")),"setup":str(anchor.get("setup") or "在旅程开头留下问题"),"payoff":str(anchor.get("payoff") or "在真实对话中展开并于结尾回扣"),"asset_ids":anchor_ids},"chapters":[{"name":name} for name in chapters],"timeline":timeline},"shorts":shorts,"short_style_seed":style_seed,"music_mood":intent.get("music_mood") if isinstance(intent.get("music_mood"),list) else [str(intent.get("music_mood") or "轻快日常、克制温暖")],"review_warnings":list(intent.get("review_warnings") or []) if isinstance(intent.get("review_warnings"),list) else [],"generation_method":"compact_ai_plus_deterministic_timeline_v4_dynamic_duration"}
+    plan={"title":str(intent.get("title") or ("黄金周的东京散步" if "黄金周" in context else "一日生活记录")),"summary":str(intent.get("summary") or "以真实移动、街景、饮食和朋友交流串起当天经历。"),"long":{"target_seconds":round(target,1),"selection_ratio":round(target/available,4),**selection,"story_anchor":{"topic":str(anchor.get("topic") or ("中日数字手势的差异" if "手势" in context else "朋友交流中的意外发现")),"setup":str(anchor.get("setup") or "在旅程开头留下问题"),"payoff":str(anchor.get("payoff") or "在真实对话中展开并于结尾回扣"),"asset_ids":anchor_ids},"chapters":[{"name":name} for name in chapters],"timeline":timeline},"shorts":shorts,"short_style_seed":style_seed,"music_mood":intent.get("music_mood") if isinstance(intent.get("music_mood"),list) else [str(intent.get("music_mood") or "轻快日常、克制温暖")],"review_warnings":list(intent.get("review_warnings") or []) if isinstance(intent.get("review_warnings"),list) else [],"generation_method":"compact_ai_plus_deterministic_timeline_v5_quality_first"}
     if used_fallback:plan["review_warnings"].append("AI创意结构未能解析，已使用确定性故事结构回退；时间线仍已通过真实素材校验。")
     errors=story_plan_errors(plan,assets)
     if errors:raise RuntimeError("确定性时间线构建失败："+"；".join(errors[:12]))

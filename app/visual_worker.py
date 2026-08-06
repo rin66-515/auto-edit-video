@@ -13,14 +13,14 @@ import torch
 from transformers import AutoModelForImageTextToText,AutoProcessor,BitsAndBytesConfig
 from . import db
 from .config import MUSIC
+from .editorial_rules import inherit_long_replan_defaults,merge_scoped_story_plan,parse_long_replan_directives,scoped_prompt_context
 from .media import analyze_music_rhythm,probe
+from .render_plan import requested_snapshot
 from .story_planner import assemble_story_plan,manual_short_reselection,story_plan_errors,valid_story_plan
 
 POLL=int(os.getenv("VL_POLL_SECONDS","20"))
 MODEL_NAME=os.getenv("VL_MODEL","Qwen/Qwen3-VL-4B-Instruct")
 PROMPT="""你是生活Vlog素材分析员。只根据画面返回JSON，不要markdown。字段：summary场景摘要，quality从0到100，problems数组（模糊、抖动、曝光、遮挡等），subjects数组，actions数组，mood，story_value从0到100，suggested_use（主线/B-roll/过场/弃用），duplicate_hint。不要猜测看不到的信息。"""
-DUAL_STYLE="""固定双风格规范：长篇供YouTube与Bilibili共用，是10–60分钟、默认20–40分钟的日系生活纪录；节奏舒缓、有留白，重视移动过程、街景、饮食细节、真实对话和情绪余韵。从转写与画面中找出一个真实的“故事锚点”（优先文化差异、朋友互动、意外发现或有记忆点的观点），可用不同但相邻的真实片段在开头预告、中段展开、结尾回扣，不能重复同一时间区间。短篇供抖音与小红书共用，必须和长篇形成明显反差：前1–3秒直接给真实问题、反差、反应或结论作为钩子，关键词前置，剪辑更紧凑，交替使用对话、手部或物件特写、朋友反应和场景切换，并让结尾形成回答、反转或自然回环；禁止虚构冲突、标题党和与素材无关的梗。优先把文化差异和朋友交流剪成具有讨论度、可评论的网感短篇。"""
-SHORT_AUDIO_STYLE="""短篇由指定BGM主导，镜头按音乐节奏密集编排，并在BGM能量点允许2–4组连续快闪。AI必须为每个短篇选择voice_mode，只能是bgm_only或selective_dialogue，并给出voice_reason：画面与音乐能说清楚时选bgm_only；只有真实对话是故事成立所必需时才选selective_dialogue，且只保留一至三句点题人声。字幕只跟随这些被选中的人声，不能全程铺字幕。"""
 
 def load_model():
     quant=BitsAndBytesConfig(load_in_4bit=True,bnb_4bit_quant_type="nf4",bnb_4bit_compute_dtype=torch.bfloat16,bnb_4bit_use_double_quant=True)
@@ -98,23 +98,32 @@ def generation_heartbeat(project_id,resume_status):
     try:yield
     finally:stop.set();thread.join(timeout=1)
 
-def generate_valid_plan(model,processor,prompt,assets,project_id=None,resume_status="revision_requested"):
+def generate_valid_plan(model,processor,prompt,assets,project_id=None,resume_status="revision_requested",scope="both",directives=None):
+    label={"long_16x9":"长篇","short_9x16":"短篇","both":"长篇与短篇"}[scope]
     if project_id:
         db.set_progress(project_id,resume_status,"剪辑方案生成","AI创意构思 · 时间线将按真实素材自动展开")
-        db.log_event(project_id,"info","剪辑方案生成","output_target","本轮目标：1 部10–60分钟的动态长篇 + 1 部短篇草案；长篇时长由素材故事价值决定，短篇导出时可再按指定BGM时长重排")
-        db.log_event(project_id,"info","剪辑方案生成","generation_started","开始生成紧凑编辑意图，不再要求AI输出数百个时间线片段")
+        db.log_event(project_id,"info","剪辑方案生成","output_target",f"本轮仅规划{label}；另一格式的规则与方案不会参与或被覆盖",{"scope":scope})
+        db.log_event(project_id,"info","剪辑方案生成","generation_started",f"开始生成{label}紧凑编辑意图，不再要求AI输出数百个时间线片段",{"scope":scope})
     with generation_heartbeat(project_id,resume_status) if project_id else nullcontext():
         intent=text_json(model,processor,prompt[:48000],1280)
     fallback=not isinstance(intent,dict) or bool(intent.get("parse_warning"))
     if fallback:
         if project_id:db.log_event(project_id,"warning","剪辑方案生成","intent_fallback","AI创意结构未能解析，已自动切换确定性故事结构；不会再次盲目重试",{"raw_preview":str(intent.get("raw") or "")[:500] if isinstance(intent,dict) else ""})
         intent={}
+    directives=directives if isinstance(directives,dict) else {}
+    if scope=="long_16x9" and directives.get("duration_min_minutes") is not None:
+        intent["long_duration_constraint"]={
+            "min_minutes":directives["duration_min_minutes"],
+            "max_minutes":directives["duration_max_minutes"],
+            "preferred_minutes":directives["duration_preferred_minutes"],
+            "source":"human_version_feedback",
+        }
     plan=assemble_story_plan(intent,assets,prompt,used_fallback=fallback);errors=story_plan_errors(plan,assets)
     if errors:raise RuntimeError("确定性时间线校验失败："+"；".join(errors[:12]))
     if project_id:
         long_seconds=sum(float(item["end"])-float(item["start"]) for item in plan["long"]["timeline"]);short_count=len(plan["shorts"]);total_files=1+short_count
         db.set_progress(project_id,resume_status,"剪辑方案生成",f"时间线已校验 · 长篇 {long_seconds/60:.1f} 分钟 · {short_count} 条短篇")
-        db.log_event(project_id,"success","剪辑方案生成","generation_validated",f"确定性时间线通过校验：1 部 {long_seconds/60:.1f} 分钟长篇 + {short_count} 部短篇，共 {total_files} 个成片文件",{"long_seconds":round(long_seconds,1),"long_clips":len(plan["long"]["timeline"]),"short_files":short_count,"total_files":total_files,"fallback":fallback})
+        db.log_event(project_id,"success","剪辑方案生成","generation_validated",f"{label}确定性时间线通过校验",{"scope":scope,"long_seconds":round(long_seconds,1),"long_clips":len(plan["long"]["timeline"]),"short_files":short_count,"total_files":total_files,"fallback":fallback,"directives":directives})
     return plan
 
 def create_story_plan(model,processor,project):
@@ -122,8 +131,18 @@ def create_story_plan(model,processor,project):
     for asset in assets:
         analysis=json.loads(asset.get("analysis") or "{}")
         material.append({"asset_id":asset['id'],"filename":asset['filename'],"duration":asset['duration'],"transcript":analysis.get('transcript','')[:3000],"visual":analysis.get('visual',{})})
-    prompt="""你是生活Vlog总剪辑师。只生成紧凑的编辑意图JSON，不要输出timeline、start或end；程序会根据真实素材时长展开时间线。制作备注是高优先级要求。"""+DUAL_STYLE+SHORT_AUDIO_STYLE+"""根据素材故事密度建议long_target_minutes（10到60，可用小数，不要机械选择30），并选择章节、故事锚点、素材优先级和1个短篇主题。短篇必须是抖音/小红书网感叙事，组合多个真实素材、前3秒强钩子、对话/反应/细节交替，不能只摘一段精彩。只能引用真实asset_id。结构：{title,summary,long_target_minutes:数字,story_anchor:{topic,setup,payoff,asset_ids:[整数]},chapters:[{name}],asset_priorities:[{asset_id,priority:0到100,chapter}],shorts:[{title,hook,cover_text,core_payoff,pacing,voice_mode,voice_reason,asset_ids:[整数]}],music_mood:[字符串],review_warnings:[字符串]}。整个JSON保持精简，asset_priorities最多12项。制作备注："""+str(project.get("notes") or "无")+"\n素材："+json.dumps(material,ensure_ascii=False)
-    return generate_valid_plan(model,processor,prompt,assets,project['id'],"ready_for_visual")
+    settings=json.loads(project.get("settings") or "{}")
+    base="""你是生活Vlog总剪辑师。只返回紧凑编辑意图JSON，不要输出timeline、start或end；程序会根据真实素材时长展开并校验时间线。只能引用真实asset_id。"""
+    long_prompt=base+scoped_prompt_context("long_16x9",settings,project.get("notes"))+"""只规划长篇。结构：{title,summary,long_target_minutes:数字,story_anchor:{topic,setup,payoff,asset_ids:[整数]},chapters:[{name}],asset_priorities:[{asset_id,priority:0到100,chapter}],music_mood:[字符串],review_warnings:[字符串]}。asset_priorities最多12项。素材："""+json.dumps(material,ensure_ascii=False)
+    short_prompt=base+scoped_prompt_context("short_9x16",settings,project.get("notes"))+"""只规划一条短篇主题，并从全部素材独立选材。结构：{title,summary,shorts:[{title,hook,cover_text,core_payoff,pacing,voice_mode,voice_reason,asset_ids:[整数]}],short_style_seed:字符串,review_warnings:[字符串]}。素材："""+json.dumps(material,ensure_ascii=False)
+    long_plan=generate_valid_plan(model,processor,long_prompt,assets,project['id'],"ready_for_visual","long_16x9")
+    short_plan=generate_valid_plan(model,processor,short_prompt,assets,project['id'],"ready_for_visual","short_9x16")
+    plan=merge_scoped_story_plan(long_plan,short_plan,"short_9x16")
+    plan["review_warnings"]=list(long_plan.get("review_warnings") or [])+list(short_plan.get("review_warnings") or [])
+    plan["generation_method"]="scoped_long_short_planning_v1"
+    errors=story_plan_errors(plan,assets)
+    if errors:raise RuntimeError("长短篇独立方案合并校验失败："+"；".join(errors[:12]))
+    return plan
 
 def compact_existing_plan(plan):
     if not isinstance(plan,dict):return {}
@@ -249,8 +268,12 @@ def _next_version(project_id):
     return f"v{max(versions,default=0)+1}"
 
 def _finalize_version_bound_replan(project,settings,source,revisions):
-    snapshot=_plan_snapshot(settings.get("story_plan") or {},source["format"]);version=_next_version(project["id"]);revision_ids=[int(value["id"]) for value in revisions]
-    options={"plan_rebuild":{"source_export_id":source["id"],"source_version":source["version"],"revision_ids":revision_ids}}
+    version=_next_version(project["id"]);revision_ids=[int(value["id"]) for value in revisions]
+    if source["format"]=="long_16x9":
+        snapshot,format_options=requested_snapshot(project["id"],version,source["format"],settings)
+    else:
+        snapshot=_plan_snapshot(settings.get("story_plan") or {},source["format"]);format_options={}
+    options={"plan_rebuild":{"source_export_id":source["id"],"source_version":source["version"],"revision_ids":revision_ids},**format_options}
     # Carry the source version's render choices into the rebuilt version.  In
     # particular, a short version must keep its selected BGM when the user
     # starts the newly planned version directly from the control panel.
@@ -317,6 +340,8 @@ def revise(project):
     try:
         settings=json.loads(project.get('settings') or '{}');request=settings.get("replan_request") if isinstance(settings.get("replan_request"),dict) else None;source=None
         if request:
+            if request.get("mode")!="full_replan":
+                raise RuntimeError("版本意见默认必须走增量修改；只有明确二次确认的完整重规划可以进入规划工作器")
             try:source_id=int(request.get("source_export_id"))
             except (TypeError,ValueError):raise RuntimeError("版本重规划请求缺少来源版本")
             source=db.row("SELECT id,version,format,status,render_options,timeline_snapshot FROM exports WHERE id=? AND project_id=?",(source_id,project['id']))
@@ -329,32 +354,68 @@ def revise(project):
         else:
             revisions=db.rows("SELECT id,kind,body,source_version FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NULL ORDER BY id",(project['id'],))
             if not revisions:raise RuntimeError("没有待处理的项目级重规划意见")
+        scope=source["format"] if source else "both"
+        directives=parse_long_replan_directives(revisions) if scope in {"long_16x9","both"} else {}
+        if source and scope=="long_16x9":
+            try:source_snapshot=json.loads(source.get("timeline_snapshot") or "{}")
+            except (AttributeError,TypeError,json.JSONDecodeError):source_snapshot={}
+            try:source_options=json.loads(source.get("render_options") or "{}")
+            except (AttributeError,TypeError,json.JSONDecodeError):source_options={}
+            directives=inherit_long_replan_defaults(directives,source_snapshot,source_options)
+            if directives.get("duration_inherited") or directives.get("audio_policy_inherited"):
+                db.log_event(project['id'],"info","完整重规划","source_defaults_inherited",f"{source['version']} 未明确改变的时长和音频策略已继承",{"source_export_id":source["id"],"source_version":source["version"],"directives":directives})
         assets=db.rows("SELECT * FROM assets WHERE project_id=? ORDER BY id",(project['id'],));catalog=[]
         for asset in assets:
             analysis=json.loads(asset.get("analysis") or "{}")
-            if int(analysis.get("caption_version") or 0)<3:
+            if directives.get("reanalyze_assets"):
+                if not db.checkpoint(project['id'],"revision_requested","画面重新审核",asset['filename']):return
+                visual_model,visual_processor=get_model()
+                analysis["visual"]=analyze(visual_model,visual_processor,visual_samples(asset));analysis["visual_model"]=MODEL_NAME
+                analysis["visual_reanalyzed_at"]=db.now()
+                db.log_event(project['id'],"info","画面重新审核","visual_reanalyzed",f"已重新审核原素材：{asset['filename']}",{"asset_id":asset['id']})
+            if int(analysis.get("caption_version") or 0)<3 or directives.get("reproofread_captions"):
                 if not db.checkpoint(project['id'],"revision_requested","字幕二次精校",asset['filename']):return
                 caption_model,caption_processor=get_model()
                 analysis["bilingual_captions"]=create_bilingual_captions(caption_model,caption_processor,analysis,asset.get('duration') or 0);analysis["caption_version"]=3
+                analysis["caption_reproofread_at"]=db.now()
                 db.execute("UPDATE assets SET analysis=? WHERE id=?",(json.dumps(analysis,ensure_ascii=False),asset['id']))
-                db.log_event(project['id'],"info","字幕二次精校","caption_proofread",f"中日字幕已二次精校：{asset['filename']}",{"asset_id":asset['id']})
+                db.log_event(project['id'],"info","字幕二次精校","caption_proofread",f"中日字幕已重新精校：{asset['filename']}" if directives.get("reproofread_captions") else f"中日字幕已二次精校：{asset['filename']}",{"asset_id":asset['id'],"forced":bool(directives.get("reproofread_captions"))})
+            elif directives.get("reanalyze_assets"):
+                db.execute("UPDATE assets SET analysis=? WHERE id=?",(json.dumps(analysis,ensure_ascii=False),asset['id']))
             catalog.append({"asset_id":asset["id"],"filename":asset["filename"],"duration":asset["duration"],"transcript":analysis.get("transcript","")[:1200],"visual":analysis.get("visual",{})})
-        scope=f"本轮仅应用来源版本 {source['version']} 的绑定意见。" if source else "本轮仅应用未关联版本的项目级意见。"
         source_timeline=[]
         if source and source["format"]=="short_9x16":
             try:source_timeline=(json.loads(source.get("timeline_snapshot") or "{}").get("short-1") or [])
             except (AttributeError,TypeError,json.JSONDecodeError):source_timeline=[]
         manual_short=_manual_short_for_revisions(revisions,assets,settings,project['id'],source['version'] if source else None,source_timeline) if source and source["format"]=="short_9x16" else None
+        existing=settings.get("story_plan") if isinstance(settings.get("story_plan"),dict) else {}
         if manual_short and valid_story_plan(settings.get("story_plan"),assets):
-            plan=dict(settings["story_plan"])
+            plan=merge_scoped_story_plan(existing,{"shorts":[manual_short]},"short_9x16");plan["generation_method"]="scoped_short_structured_revision_v1"
         else:
-            prompt="""你是生活Vlog总剪辑师。只根据人工意见生成紧凑的编辑意图JSON，不要输出timeline、start或end；程序会按真实素材时长构建并校验时间线。制作备注和人工意见优先。"""+DUAL_STYLE+SHORT_AUDIO_STYLE+"""根据素材故事密度建议long_target_minutes（10到60，可用小数，不要机械选择30），并提出1个由多个真实素材组合的抖音/小红书网感短篇主题，不能只摘一段精彩。只能引用真实asset_id。结构：{title,summary,long_target_minutes:数字,story_anchor:{topic,setup,payoff,asset_ids:[整数]},chapters:[{name}],asset_priorities:[{asset_id,priority:0到100,chapter}],shorts:[{title,hook,cover_text,core_payoff,pacing,voice_mode,voice_reason,asset_ids:[整数]}],music_mood:[字符串],review_warnings:[字符串]}。整个JSON保持精简，asset_priorities最多12项。"""+scope+"制作备注："+str(project.get("notes") or "无")+"\n人工意见："+json.dumps(revisions,ensure_ascii=False)+"\n素材："+json.dumps(catalog,ensure_ascii=False)+"\n现有计划概述："+json.dumps(compact_existing_plan(settings.get('story_plan',{})),ensure_ascii=False)
             planning_model,planning_processor=get_model()
-            plan=generate_valid_plan(planning_model,planning_processor,prompt,assets,project['id'],"revision_requested");settings['story_model']=MODEL_NAME
+            base="""你是生活Vlog总剪辑师。只根据人工意见返回紧凑编辑意图JSON，不要输出timeline、start或end；程序会按真实素材时长构建并校验时间线。只能引用真实asset_id。"""
+            if scope=="long_16x9":
+                prompt=base+scoped_prompt_context("long_16x9",settings,project.get("notes"),revisions)+"""只重规划长篇，不得提出或修改短篇。结构：{title,summary,long_target_minutes:数字,story_anchor:{topic,setup,payoff,asset_ids:[整数]},chapters:[{name}],asset_priorities:[{asset_id,priority:0到100,chapter}],music_mood:[字符串],review_warnings:[字符串]}。asset_priorities最多12项。现有长篇："""+json.dumps({"long":existing.get("long")},ensure_ascii=False)+"\n素材："+json.dumps(catalog,ensure_ascii=False)
+                generated=generate_valid_plan(planning_model,planning_processor,prompt,assets,project['id'],"revision_requested","long_16x9",directives)
+                plan=merge_scoped_story_plan(existing,generated,"long_16x9");plan["generation_method"]="scoped_long_replan_v1"
+                if directives.get("audio_policy"):plan["long"]["audio_policy"]=directives["audio_policy"]
+            elif scope=="short_9x16":
+                prompt=base+scoped_prompt_context("short_9x16",settings,project.get("notes"),revisions)+"""只重规划一条短篇，不得提出或修改长篇。短篇必须从全部素材独立选材。结构：{title,summary,shorts:[{title,hook,cover_text,core_payoff,pacing,voice_mode,voice_reason,asset_ids:[整数]}],short_style_seed:字符串,review_warnings:[字符串]}。现有短篇："""+json.dumps({"shorts":existing.get("shorts")},ensure_ascii=False)+"\n素材："+json.dumps(catalog,ensure_ascii=False)
+                generated=generate_valid_plan(planning_model,planning_processor,prompt,assets,project['id'],"revision_requested","short_9x16")
+                plan=merge_scoped_story_plan(existing,generated,"short_9x16");plan["generation_method"]="scoped_short_replan_v1"
+            else:
+                long_prompt=base+scoped_prompt_context("long_16x9",settings,project.get("notes"),revisions)+"""只规划长篇。结构：{title,summary,long_target_minutes:数字,story_anchor:{topic,setup,payoff,asset_ids:[整数]},chapters:[{name}],asset_priorities:[{asset_id,priority:0到100,chapter}],review_warnings:[字符串]}。素材："""+json.dumps(catalog,ensure_ascii=False)
+                short_prompt=base+scoped_prompt_context("short_9x16",settings,project.get("notes"),revisions)+"""只规划一条短篇。结构：{title,summary,shorts:[{title,hook,cover_text,core_payoff,pacing,voice_mode,voice_reason,asset_ids:[整数]}],short_style_seed:字符串,review_warnings:[字符串]}。素材："""+json.dumps(catalog,ensure_ascii=False)
+                long_generated=generate_valid_plan(planning_model,planning_processor,long_prompt,assets,project['id'],"revision_requested","long_16x9",directives)
+                short_generated=generate_valid_plan(planning_model,planning_processor,short_prompt,assets,project['id'],"revision_requested","short_9x16")
+                plan=merge_scoped_story_plan(long_generated,short_generated,"short_9x16");plan["generation_method"]="scoped_common_replan_v1"
+                if directives.get("audio_policy"):plan["long"]["audio_policy"]=directives["audio_policy"]
+            settings['story_model']=MODEL_NAME
         if manual_short:
-            plan["shorts"]=[manual_short];plan["generation_method"]="structured_revision_v2"
             manual=manual_short.get("manual_replan") or {}
             db.log_event(project['id'],"success","剪辑方案生成","structured_revision",f"已按结构化意见重构短篇：{manual.get('actual_clip_count') or len(manual.get('sources') or [])} 段镜头 · {manual.get('target_seconds')} 秒 · 人声镜头 {manual.get('voice_clips') or []}",manual)
+        errors=story_plan_errors(plan,assets)
+        if errors:raise RuntimeError("格式隔离后的剪辑方案校验失败："+"；".join(errors[:12]))
         settings["story_plan"]=plan
         if not db.checkpoint(project['id'],"revision_requested",stage,"整套方案"):return
         if source:

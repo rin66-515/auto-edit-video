@@ -6,18 +6,21 @@ from unittest.mock import patch
 import numpy as np
 
 from app import privacy
-from app.privacy import TRACK_LEAD_FRAMES,TRACK_TAIL_FRAMES,_identity_reference_files,_overlay_avatar,_plausible_face,_primary_face,_rule_matches,_track_covers_frame,_track_is_live
+from app.privacy import TRACK_LEAD_FRAMES,TRACK_TAIL_FRAMES,_identity_reference_files,_pixelate_face,_plausible_face,_primary_face,_rule_matches,_track_covers_frame,_track_is_live,privacy_enabled
 
 
 class PrivacyOverlayTest(unittest.TestCase):
-    def test_avatar_overlay_replaces_face_area_without_pixelation(self):
-        frame=np.full((120,120,3),80,dtype=np.uint8);avatar=np.zeros((80,80,3),dtype=np.uint8);avatar[:,:,1]=220
-        _overlay_avatar(frame,np.array([40,35,32,38],dtype=np.float32),avatar)
-        self.assertGreater(int(frame[60,60,1]),150)
-        self.assertTrue(np.all(frame[0,0]==80))
-        _overlay_avatar(frame,np.array([-8,-12,40,44],dtype=np.float32),avatar)
+    def test_normal_mosaic_pixelates_face_area_and_keeps_outside_pixels(self):
+        y,x=np.indices((120,120));frame=np.stack((x,y,(x+y)%255),axis=-1).astype(np.uint8);before=frame.copy()
+        _pixelate_face(frame,np.array([40,35,32,38],dtype=np.float32))
+        self.assertTrue(np.array_equal(frame[0,0],before[0,0]))
+        self.assertFalse(np.array_equal(frame[60,60],before[60,60]))
+        self.assertLess(len(np.unique(frame[30:95,30:95].reshape(-1,3),axis=0)),len(np.unique(before[30:95,30:95].reshape(-1,3),axis=0)))
+        _pixelate_face(frame,np.array([-8,-12,40,44],dtype=np.float32))
         self.assertEqual((120,120,3),frame.shape)
 
+    def test_privacy_is_manual_only_by_default(self):
+        self.assertFalse(privacy_enabled({}));self.assertTrue(privacy_enabled({}, {"force_cover":[{"start":1,"end":2}]}))
     def test_static_track_is_suppressed_and_live_track_has_lead_tail(self):
         track={"owner":False,"owner_hits":0,"seen":8,"max_motion":0.2,"confirmed":False,"start":10,"last":20}
         self.assertFalse(_track_is_live(track))

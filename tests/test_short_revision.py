@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from app import db
-from app.manual_revision import create_short_privacy_revision
+from app.manual_revision import create_privacy_revision
 from app.short_revision import release_scheduled_short
 
 
@@ -31,8 +31,8 @@ class ScheduledShortReleaseTest(unittest.TestCase):
             try:
                 db.init_db();stamp=db.now();project_id=db.execute("INSERT INTO projects(slug,title,source_dir,status,settings,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",("short-test","Short Test","/vlog/inbox/short-test","review_ready","{}",stamp,stamp));db.create_control(project_id,"stopped",None,"人工审核","等待人工审核")
                 snapshot={"short-1":[{"asset_id":1,"start":0,"end":2}],"short-2":[{"asset_id":2,"start":0,"end":2}]};source_id=db.execute("INSERT INTO exports(project_id,version,format,status,timeline_snapshot,render_options,created_at) VALUES(?,?,?,?,?,?,?)",(project_id,"v7","short_9x16","review_ready",json.dumps(snapshot),json.dumps({"short_style_profiles":["city_pulse","warm_rhythm"]}),stamp))
-                result=create_short_privacy_revision(project_id,source_id,{"suppress":[{"start":0,"end":2.4}]},"keep anchor",["short-1"]);created=db.row("SELECT timeline_snapshot,render_options FROM exports WHERE id=?",(result["export_id"],))
-                self.assertEqual(["short-1"],list(json.loads(created["timeline_snapshot"])));self.assertEqual(["short-1"],json.loads(created["render_options"])["kept_outputs"])
+                result=create_privacy_revision(project_id,source_id,{"force_cover":[{"start":0,"end":2.4}]},"cover anchor",["short-1"]);created=db.row("SELECT timeline_snapshot,render_options,render_mode FROM exports WHERE id=?",(result["export_id"],))
+                self.assertEqual(["short-1"],list(json.loads(created["timeline_snapshot"])));self.assertEqual(["short-1"],json.loads(created["render_options"])["kept_outputs"]);self.assertEqual("privacy_only",created["render_mode"])
             finally:db.DB_PATH=original
 
 

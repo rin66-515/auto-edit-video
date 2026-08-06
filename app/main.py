@@ -17,8 +17,11 @@ from .caption_workbook import build_caption_workbook,read_caption_workbook
 from .config import INBOX,PROXIES,OUTPUTS,PROJECTS,MIN_FREE_GIB,VIDEO_EXTENSIONS
 from .pipeline import start_background,scan_once,cleanup_project_temp
 from .render_plan import RenderPlanError,requested_snapshot
-from .revision_intent import parse_revision_intent
+from .revision_intent import parse_revision_intent,revision_mode
+from .privacy_intent import parse_privacy_intent
+from .manual_revision import create_privacy_revision
 from .short_revision import release_scheduled_short
+from .version_revision import create_inherited_revision,validate_inherited_revision
 
 PLATFORMS=("youtube","bilibili","douyin","xiaohongshu")
 @asynccontextmanager
@@ -37,6 +40,8 @@ class RevisionIn(BaseModel):
     kind:str="edit"
     body:str
     source_export_id:int|None=None
+class RevisionApplyIn(BaseModel):
+    confirm_full_replan:bool=False
 class SettingsIn(BaseModel):mode:str="existing";notes:str="";settings:dict=Field(default_factory=dict)
 class CaptionWorkbookImportIn(BaseModel):filename:str="captions.xlsx";xlsx_base64:str
 @app.get("/")
@@ -57,6 +62,10 @@ def _revision_source_clip_count(export):
     except json.JSONDecodeError:return None
     timeline=snapshot.get("short-1") if isinstance(snapshot,dict) else None
     return len(timeline) if isinstance(timeline,list) and timeline else None
+def _parse_revision(revisions,source=None):
+    if any(str(value.get("kind") or "")=="privacy" for value in revisions if isinstance(value,dict)):
+        return parse_privacy_intent(revisions)
+    return parse_revision_intent(revisions,_revision_source_clip_count(source))
 
 @app.get("/api/projects/{project_id}")
 def project(project_id:int):
@@ -65,7 +74,7 @@ def project(project_id:int):
     exports={int(value["id"]):value for value in item.get("exports") or []}
     for revision in item.get("revisions") or []:
         source=exports.get(int(revision.get("source_export_id") or 0))
-        revision["parsed_intent"]=parse_revision_intent([revision],_revision_source_clip_count(source))
+        revision["parsed_intent"]=_parse_revision([revision],source)
     return item
 
 @app.get("/api/projects/{project_id}/live")
@@ -73,6 +82,7 @@ def project_live(project_id:int):
     item=db.row("SELECT id,status,error FROM projects WHERE id=?",(project_id,))
     if not item:raise HTTPException(404,"项目不存在")
     item["control"]=db.control(project_id);item["render_queue"]=db.render_queue(project_id);item["workers"]=db.worker_statuses();resume=(item["control"] or {}).get("resume_status") or item["status"];item["required_worker"]=db.required_worker_for_status(resume);item["logs"]=db.rows("SELECT * FROM project_logs WHERE project_id=? ORDER BY id DESC LIMIT 200",(project_id,))
+    item["locked_short"]=db.row("SELECT id,version,status FROM exports WHERE project_id=? AND format='short_9x16' AND locked=1 AND status='approved' ORDER BY id DESC LIMIT 1",(project_id,))
     counts=db.row("SELECT COUNT(*) AS total,SUM(CASE WHEN CAST(COALESCE(json_extract(analysis,'$.caption_version'),0) AS INTEGER)>=3 THEN 1 ELSE 0 END) AS ready FROM assets WHERE project_id=?",(project_id,)) or {"total":0,"ready":0}
     item["caption_assets_total"]=int(counts.get("total") or 0);item["caption_assets_ready"]=int(counts.get("ready") or 0);item["captions_complete"]=item["caption_assets_total"]>0 and item["caption_assets_ready"]==item["caption_assets_total"]
     return item
@@ -374,30 +384,42 @@ def discard_export_master(export_id:int):
     db.log_event(export["project_id"],"warning","母版审核","master_discarded_for_rerender",f"{export['version']} 当前母版已废弃；时间线和第 {int(export.get('caption_revision') or 0)} 轮字幕修正已保留",{"export_id":export_id,"format":export["format"],"deleted_files":deleted_files,"released_bytes":released,"caption_revision":int(export.get("caption_revision") or 0)})
     return {"ok":True,"export_id":export_id,"version":export["version"],"status":"render_requested","deleted_files":deleted_files,"released_bytes":released,"caption_revision":int(export.get("caption_revision") or 0)}
 
-@app.post("/api/exports/{export_id}/master/discard-and-replan")
-def discard_export_master_and_replan(export_id:int):
+@app.post("/api/exports/{export_id}/revisions/apply")
+def apply_version_revisions(export_id:int,body:RevisionApplyIn):
     export=db.row("SELECT e.*,p.slug,p.settings FROM exports e JOIN projects p ON p.id=e.project_id WHERE e.id=?",(export_id,))
     if not export:raise HTTPException(404,"输出版本不存在")
-    if export["status"]!="caption_review_ready":raise HTTPException(409,"只有处于母版审核/字幕校对阶段的版本才能废弃并重规划")
+    if export["status"]!="caption_review_ready":raise HTTPException(409,"只有处于母版审核/字幕校对阶段的版本才能应用版本意见")
     control=db.control(export["project_id"]) or {}
-    if control.get("desired_state") not in {"stopped","paused"}:raise HTTPException(409,"请先暂停或停止项目，再废弃母版并重规划")
-    if not _master_outputs(export):raise HTTPException(409,"该版本没有可废弃的母版")
-    revisions=db.rows("SELECT id FROM revisions WHERE project_id=? AND source_export_id=? AND status='open' ORDER BY id",(export["project_id"],export_id))
-    if not revisions:raise HTTPException(409,f"请先在“剪辑方案重规划意见”中选择 {export['version']} 并至少提交一条意见")
-    deleted_files,released=_discard_master_files(export)
+    if control.get("desired_state") not in {"stopped","paused"}:raise HTTPException(409,"请先暂停或停止项目，再应用版本意见")
+    revisions=db.rows("SELECT id,kind,body,source_version FROM revisions WHERE project_id=? AND source_export_id=? AND status='open' AND kind!='privacy' ORDER BY id",(export["project_id"],export_id))
+    if not revisions:raise HTTPException(409,f"请先在“审核修改意见”中选择 {export['version']} 并至少提交一条意见")
+    mode=revision_mode(revisions);revision_ids=[int(value["id"]) for value in revisions]
+    if mode=="incremental":
+        try:result=create_inherited_revision(export["project_id"],export_id,revisions,revision_ids=revision_ids)
+        except ValueError as exc:
+            db.log_event(export["project_id"],"warning","应用修改意见","revision_apply_rejected",f"{export['version']} 的局部修改未创建新版本：{exc}",{"export_id":export_id,"version":export["version"],"revision_ids":revision_ids,"error":str(exc)})
+            raise HTTPException(409,str(exc)) from exc
+        return {**result,"revision_ids":revision_ids}
+    parsed=_parse_revision(revisions,export)
+    if parsed.get("has_local_timeline_edits"):
+        message="检测到明确的成片删除或插入时间码，不能执行完整重规划。请删除这条完整重规划意见，并改用‘局部剪辑调整’"
+        db.log_event(export["project_id"],"warning","完整重规划","local_timecode_replan_blocked",f"{export['version']} 已阻止误用完整重规划",{"export_id":export_id,"version":export["version"],"revision_ids":revision_ids,"output_deletions":parsed.get("output_deletions") or [],"insertions":parsed.get("insertions") or []})
+        raise HTTPException(409,message)
+    if not body.confirm_full_replan:
+        raise HTTPException(409,"完整重规划必须在页面二次确认；来源版本将保留，不会自动删除")
     try:settings=json.loads(export.get("settings") or "{}")
     except json.JSONDecodeError:settings={}
-    stamp=db.now();request={"source_export_id":export_id,"source_version":export["version"],"format":export["format"],"revision_ids":[value["id"] for value in revisions],"requested_at":stamp}
+    stamp=db.now();request={"source_export_id":export_id,"source_version":export["version"],"format":export["format"],"revision_ids":revision_ids,"requested_at":stamp,"mode":"full_replan"}
     settings["replan_request"]=request
-    db.execute("UPDATE exports SET status='replan_requested',path=NULL,master_manifest='{}',render_mode='full',caption_locked_at=NULL WHERE id=?",(export_id,))
+    db.execute("UPDATE exports SET status='replan_requested' WHERE id=?",(export_id,))
     db.execute("UPDATE projects SET status='revision_requested',settings=?,error=NULL,updated_at=? WHERE id=?",(json.dumps(settings,ensure_ascii=False),stamp,export["project_id"]))
-    db.create_control(export["project_id"],"stopped","revision_requested","修改剪辑方案",f"{export['version']} 母版已废弃，待读取 {len(revisions)} 条版本意见",render_scope=export["format"])
-    db.log_event(export["project_id"],"warning","母版审核","master_discarded_for_replan",f"{export['version']} 母版已废弃；将在启动项目后读取 {len(revisions)} 条绑定意见并创建新版本",{"export_id":export_id,"format":export["format"],"revision_ids":request["revision_ids"],"deleted_files":deleted_files,"released_bytes":released})
-    return {"ok":True,"export_id":export_id,"version":export["version"],"status":"replan_requested","revision_ids":request["revision_ids"],"deleted_files":deleted_files,"released_bytes":released}
+    db.create_control(export["project_id"],"stopped","revision_requested","完整重规划",f"{export['version']} 来源母版已保留，待读取 {len(revisions)} 条版本意见",render_scope=export["format"])
+    db.log_event(export["project_id"],"warning","完整重规划","full_replan_requested",f"{export['version']} 已明确请求完整重规划；来源时间线和母版保留到新版本建立后",{"export_id":export_id,"format":export["format"],"revision_ids":revision_ids,"source_master_preserved":True})
+    return {"ok":True,"mode":"full_replan","export_id":export_id,"version":export["version"],"status":"replan_requested","revision_ids":revision_ids,"source_master_preserved":True}
 
 @app.delete("/api/exports/{export_id}")
 def delete_export(export_id:int):
-    export=db.row("SELECT e.*,p.status AS project_status,p.slug FROM exports e JOIN projects p ON p.id=e.project_id WHERE e.id=?",(export_id,))
+    export=db.row("SELECT e.*,p.status AS project_status,p.slug,p.settings AS project_settings FROM exports e JOIN projects p ON p.id=e.project_id WHERE e.id=?",(export_id,))
     if not export:raise HTTPException(404,"输出版本不存在")
     control=db.control(export["project_id"])
     if control["desired_state"] not in {"stopped","paused"}:raise HTTPException(409,"请先暂停或停止项目再删除历史版本")
@@ -421,9 +443,14 @@ def delete_export(export_id:int):
     db.execute("UPDATE exports SET source_export_id=NULL WHERE source_export_id=?",(export_id,))
     db.execute("DELETE FROM exports WHERE id=?",(export_id,))
     remaining=db.row("SELECT id FROM exports WHERE project_id=? AND status IN ('render_requested','rendering') LIMIT 1",(export["project_id"],))
-    if not remaining and export["project_status"] in {"render_requested","rendering"}:
+    try:project_settings=json.loads(export.get("project_settings") or "{}")
+    except json.JSONDecodeError:project_settings={}
+    replan_request=project_settings.get("replan_request")
+    has_replan_request=isinstance(replan_request,dict) and bool(replan_request)
+    if not remaining and not has_replan_request and export["project_status"] in {"render_requested","rendering"}:
         next_status="review_ready" if db.row("SELECT id FROM exports WHERE project_id=? AND status IN ('review_ready','approved') AND path IS NOT NULL AND path!='[]' LIMIT 1",(export["project_id"],)) else "draft_ready"
         db.execute("UPDATE projects SET status=?,updated_at=? WHERE id=?",(next_status,db.now(),export["project_id"]))
+        db.create_control(export["project_id"],"stopped",None,"人工审核","没有待渲染版本",render_scope=None)
     db.log_event(export["project_id"],"warning","输出版本","export_deleted",f"已删除 {export['version']} · {export['format']}",{"status":export["status"],"deleted_files":deleted,"released_bytes":released})
     return {"ok":True,"deleted_files":len(deleted),"released_bytes":released}
 @app.put("/api/projects/{project_id}")
@@ -458,13 +485,13 @@ def control_project(project_id:int,action:str):
             try:settings=json.loads(project.get("settings") or "{}")
             except json.JSONDecodeError:settings={}
             request=settings.get("replan_request") if isinstance(settings.get("replan_request"),dict) else None
-            project_revision=db.row("SELECT id FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NULL LIMIT 1",(project_id,))
+            project_revision=db.row("SELECT id FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NULL AND kind!='privacy' LIMIT 1",(project_id,))
             if not request and not project_revision:
-                version_revisions=db.rows("SELECT DISTINCT source_version FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NOT NULL ORDER BY source_version",(project_id,))
+                version_revisions=db.rows("SELECT DISTINCT source_version FROM revisions WHERE project_id=? AND status='open' AND source_export_id IS NOT NULL AND kind!='privacy' ORDER BY source_version",(project_id,))
                 if version_revisions:
                     labels="、".join(str(value.get("source_version") or "该版本") for value in version_revisions)
                     db.log_event(project_id,"warning","修改剪辑方案","version_replan_not_requested",f"仅存在版本级意见：{labels}；已阻止误启动项目级重规划",{"versions":[value.get("source_version") for value in version_revisions]})
-                    raise HTTPException(409,f"当前只有 {labels} 的版本级意见。请在该版本点击“废弃并重规划”后再启动；不会直接执行项目级重规划")
+                    raise HTTPException(409,f"当前只有 {labels} 的版本级意见。请在该版本点击“应用修改意见”；版本意见默认继承来源时间线，不会直接执行项目级重规划")
         required_worker=db.required_worker_for_status(resume)
         if required_worker and not db.worker_online(required_worker):
             label=db.WORKERS[required_worker]
@@ -513,35 +540,71 @@ def preview_revision(project_id:int,body:RevisionIn):
     if body.source_export_id is not None:
         source=db.row("SELECT id,format,timeline_snapshot FROM exports WHERE id=? AND project_id=?",(body.source_export_id,project_id))
         if not source:raise HTTPException(404,"关联版本不存在或不属于当前项目")
-    return parse_revision_intent([{"kind":body.kind,"body":body.body}],_revision_source_clip_count(source))
+    return _parse_revision([{"kind":body.kind,"body":body.body}],source)
 
 @app.post("/api/projects/{project_id}/revisions")
 def add_revision(project_id:int,body:RevisionIn):
     project=db.row("SELECT id FROM projects WHERE id=?",(project_id,))
     if not project:raise HTTPException(404,"项目不存在")
     control=db.control(project_id) or {}
-    if control.get("desired_state") not in {"stopped","paused"}:raise HTTPException(409,"请先暂停或停止项目，再提交重规划意见")
+    if control.get("desired_state") not in {"stopped","paused"}:raise HTTPException(409,"请先暂停或停止项目，再提交修改意见")
+    if body.kind not in {"edit","shot","duration","style","audio","privacy","full_replan"}:raise HTTPException(400,"未知意见类型")
     source=None
     if body.source_export_id is not None:
-        source=db.row("SELECT id,version FROM exports WHERE id=? AND project_id=?",(body.source_export_id,project_id))
+        source=db.row("SELECT id,version,format,status,timeline_snapshot,master_manifest FROM exports WHERE id=? AND project_id=?",(body.source_export_id,project_id))
         if not source:raise HTTPException(404,"关联版本不存在或不属于当前项目")
+    if body.kind=="privacy" and not source:raise HTTPException(400,"马赛克校对必须关联一个已有母版版本")
+    if body.kind in {"audio","full_replan"} and not source:raise HTTPException(400,"音频精调和完整重规划必须关联一个已有母版版本")
+    parsed=_parse_revision([{"kind":body.kind,"body":body.body}],source)
+    if body.kind=="full_replan" and parsed.get("has_local_timeline_edits"):
+        raise HTTPException(409,"检测到明确的成片删除或插入时间码。请选择‘局部剪辑调整’，系统会继承当前版本并只修改指定位置")
+    if body.kind=="privacy":
+        rules=parsed.get("privacy_rules") or {}
+        if not rules.get("force_cover") and not rules.get("suppress"):raise HTTPException(400,"没有解析到有效的成片时间段；请填写如：22.1秒到22.8秒，右侧人物加马赛克")
+        if source.get("status")!="caption_review_ready" or not _master_outputs(source):raise HTTPException(409,"马赛克校对只能关联处于母版审核阶段的版本")
+    if source and body.kind not in {"privacy","full_replan"}:
+        pending=db.rows("SELECT id,kind,body FROM revisions WHERE project_id=? AND source_export_id=? AND status='open' AND kind!='privacy' ORDER BY id",(project_id,source["id"]))
+        candidate={"kind":body.kind,"body":body.body}
+        combined=[*pending,candidate]
+        if revision_mode(combined)=="full_replan":
+            raise HTTPException(409,"该版本已有完整重规划意见；请先处理或删除它，再提交局部修改")
+        try:validate_inherited_revision(project_id,source["id"],combined)
+        except ValueError as exc:raise HTTPException(409,str(exc)) from exc
     stamp=db.now();rid=db.execute(
         "INSERT INTO revisions(project_id,kind,body,source_export_id,source_version,created_at) VALUES(?,?,?,?,?,?)",
         (project_id,body.kind,body.body,source["id"] if source else None,source["version"] if source else None,stamp),
     )
     label=f"{source['version']} 的版本意见" if source else "项目级意见"
     if source:
-        # Version-scoped feedback is only consumed after the user explicitly
-        # discards that version's master and requests a version replan.  It
-        # must never start the project-level replan worker by itself.
-        db.log_event(project_id,"info","人工审核","revision_added",f"收到{body.kind}{label}；请在 {source['version']} 点击“废弃并重规划”后应用",{"revision_id":rid,"body":body.body,"source_export_id":source["id"],"source_version":source["version"]})
-        parsed=parse_revision_intent([{"kind":body.kind,"body":body.body}],_revision_source_clip_count(db.row("SELECT format,timeline_snapshot FROM exports WHERE id=?",(source["id"],))))
-        return {"id":rid,"ok":True,"source_export_id":source["id"],"source_version":source["version"],"waiting_for":"discard_and_replan","parsed_intent":parsed}
+        waiting="apply_privacy" if body.kind=="privacy" else "apply_revision"
+        action="点击该版本的‘应用马赛克意见’" if body.kind=="privacy" else "点击该版本的‘应用修改意见’"
+        db.log_event(project_id,"info","人工审核","revision_added",f"收到{body.kind}{label}；请{action}后应用",{"revision_id":rid,"body":body.body,"source_export_id":source["id"],"source_version":source["version"]})
+        return {"id":rid,"ok":True,"source_export_id":source["id"],"source_version":source["version"],"waiting_for":waiting,"parsed_intent":parsed}
     db.execute("UPDATE projects SET status='revision_requested',updated_at=? WHERE id=?",(stamp,project_id))
     db.create_control(project_id,"stopped","revision_requested","修改剪辑方案",f"{label}已记录，等待启动",render_scope=None)
     db.set_progress(project_id,"revision_requested","修改剪辑方案",label)
     db.log_event(project_id,"info","人工审核","revision_added",f"收到{body.kind}{label}",{"revision_id":rid,"body":body.body,"source_export_id":None,"source_version":None})
-    return {"id":rid,"ok":True,"source_export_id":None,"source_version":None,"parsed_intent":parse_revision_intent([{"kind":body.kind,"body":body.body}],None)}
+    return {"id":rid,"ok":True,"source_export_id":None,"source_version":None,"parsed_intent":parsed}
+
+@app.post("/api/exports/{export_id}/privacy-revisions/apply")
+def apply_privacy_revisions(export_id:int):
+    export=db.row("SELECT e.*,p.slug FROM exports e JOIN projects p ON p.id=e.project_id WHERE e.id=?",(export_id,))
+    if not export:raise HTTPException(404,"输出版本不存在")
+    if export.get("status")!="caption_review_ready":raise HTTPException(409,"只有处于母版审核阶段的版本才能应用马赛克意见")
+    control=db.control(export["project_id"]) or {}
+    if control.get("desired_state") not in {"stopped","paused"}:raise HTTPException(409,"请先暂停或停止项目，再应用马赛克意见")
+    revisions=db.rows("SELECT id,kind,body FROM revisions WHERE project_id=? AND source_export_id=? AND status='open' AND kind='privacy' ORDER BY id",(export["project_id"],export_id))
+    if not revisions:raise HTTPException(409,f"{export['version']} 没有待应用的马赛克校对意见")
+    parsed=parse_privacy_intent(revisions);rules=parsed.get("privacy_rules") or {}
+    if not rules.get("force_cover") and not rules.get("suppress"):raise HTTPException(409,"待应用意见没有有效的成片马赛克时间段")
+    outputs=_master_outputs(export)
+    if not outputs:raise HTTPException(409,"来源版本没有可复用的母版")
+    for output in outputs:
+        edit=Path(str(output.get("edit") or "")).resolve()
+        if not edit.is_relative_to(PROJECTS.resolve()) or not edit.is_file():raise HTTPException(409,f"来源版本的无字幕剪辑母版不存在：{output.get('name') or '成片'}")
+    try:result=create_privacy_revision(export["project_id"],export_id,rules,parsed.get("text") or "人工马赛克校对",revision_ids=[value["id"] for value in revisions])
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+    return {"ok":True,**result}
 
 @app.delete("/api/projects/{project_id}/revisions/{revision_id}")
 def delete_revision(project_id:int,revision_id:int):
@@ -564,10 +627,41 @@ def delete_revision(project_id:int,revision_id:int):
     db.log_event(project_id,"warning","剪辑方案重规划","revision_deleted",f"已删除规划意见 #{revision_id}",{"revision_id":revision_id,"status":revision["status"],"source_version":revision.get("source_version"),"applied_version":revision.get("applied_version")})
     return {"ok":True,"id":revision_id,"status":revision["status"]}
 
+def _locked_short_export(project_id:int):
+    return db.row("""SELECT id,version,status FROM exports
+                     WHERE project_id=? AND format='short_9x16' AND locked=1 AND status='approved'
+                     ORDER BY id DESC LIMIT 1""",(project_id,))
+
+def _pending_version_revisions(project_id:int,formats):
+    formats=tuple(value for value in formats if value in {"long_16x9","short_9x16"})
+    if not formats:return []
+    placeholders=",".join("?" for _ in formats)
+    return db.rows(
+        f"""SELECT r.id,r.kind,r.source_version,e.format
+              FROM revisions r JOIN exports e ON e.id=r.source_export_id
+             WHERE r.project_id=? AND r.status='open' AND r.kind!='privacy'
+               AND e.format IN ({placeholders})
+             ORDER BY r.id""",
+        (project_id,*formats),
+    )
+
+def _raise_if_pending_version_revisions(project_id:int,formats,requested_format=None):
+    pending=_pending_version_revisions(project_id,formats)
+    if not pending:return
+    grouped={}
+    for value in pending:grouped.setdefault(value["source_version"],set()).add(value["format"])
+    labels="、".join(f"{version} · {'长篇' if 'long_16x9' in fmts else '短篇'}" for version,fmts in grouped.items())
+    db.log_event(project_id,"warning","成片渲染","pending_revision_render_blocked",f"存在待应用版本意见，已阻止直接渲染：{labels}",{"requested_format":requested_format,"revisions":pending})
+    raise HTTPException(409,f"{labels} 存在待应用意见。请先在该版本点击“应用修改意见”；马赛克与字幕快速修正不受影响")
+
 def _create_export(project_id:int,fmt:str):
     if fmt not in ("long_16x9","short_9x16"):raise HTTPException(400,"未知格式")
     project=db.row("SELECT settings FROM projects WHERE id=?",(project_id,))
     if not project:raise HTTPException(404,"项目不存在")
+    _raise_if_pending_version_revisions(project_id,(fmt,),fmt)
+    if fmt=="short_9x16":
+        locked=_locked_short_export(project_id)
+        if locked:raise HTTPException(409,f"短篇 {locked['version']} 已批准锁定；请先取消锁定，再生成新的短篇版本")
     settings=json.loads(project.get("settings") or "{}");plan=settings.get("story_plan")
     if not plan:raise HTTPException(409,"剪辑方案尚未生成，不能请求导出")
     numbers=[int(value["version"][1:]) for value in db.rows("SELECT version FROM exports WHERE project_id=?",(project_id,)) if value["version"].startswith("v") and value["version"][1:].isdigit()]
@@ -583,6 +677,13 @@ def generate_export(project_id:int,fmt:str):
     if fmt not in ("long_16x9","short_9x16","both"):raise HTTPException(400,"未知格式")
     project=db.row("SELECT id,status,settings FROM projects WHERE id=?",(project_id,))
     if not project:raise HTTPException(404,"项目不存在")
+    requested_formats=("long_16x9","short_9x16") if fmt=="both" else (fmt,)
+    _raise_if_pending_version_revisions(project_id,requested_formats,fmt)
+    if fmt in {"short_9x16","both"}:
+        locked=_locked_short_export(project_id)
+        if locked:
+            db.log_event(project_id,"warning","成片渲染","locked_short_render_blocked",f"短篇 {locked['version']} 已批准锁定，已阻止新的短篇渲染请求",{"format":fmt,"export_id":locked["id"],"version":locked["version"]})
+            raise HTTPException(409,f"短篇 {locked['version']} 已批准锁定；请先点击“取消锁定”，再生成新的短篇版本")
     control=db.control(project_id) or {}
     if control.get("desired_state") not in {"stopped","paused"}:raise HTTPException(409,"项目正在运行，不能同时启动另一个版本")
     free_gib=shutil.disk_usage(INBOX).free/1024**3
@@ -646,6 +747,27 @@ def approve_export(export_id:int):
     export=db.row("SELECT project_id,version FROM exports WHERE id=?",(export_id,))
     if not export:raise HTTPException(404,"输出版本不存在")
     db.execute("UPDATE exports SET status='approved',locked=1,approved_at=? WHERE id=?",(db.now(),export_id));db.log_event(export["project_id"],"success","人工审核","export_approved",f"{export['version']} 已批准锁定");return {"ok":True}
+
+@app.post("/api/exports/{export_id}/unlock")
+def unlock_export(export_id:int):
+    export=db.row("""SELECT e.*,p.raw_deleted_at,p.upload_confirmed_at
+                     FROM exports e JOIN projects p ON p.id=e.project_id WHERE e.id=?""",(export_id,))
+    if not export:raise HTTPException(404,"导出版本不存在")
+    if export.get("status")!="approved" or not int(export.get("locked") or 0):
+        raise HTTPException(409,"该版本当前没有处于批准锁定状态")
+    control=db.control(export["project_id"]) or {}
+    if control.get("desired_state") not in {"stopped","paused"}:
+        raise HTTPException(409,"请先暂停或停止项目，再取消版本锁定")
+    if export.get("raw_deleted_at"):
+        raise HTTPException(409,"本项目原片已经删除，不能取消锁定后重新剪辑")
+    confirmed=db.row("SELECT platform FROM platform_uploads WHERE project_id=? AND completed_at IS NOT NULL LIMIT 1",(export["project_id"],))
+    if export.get("upload_confirmed_at") or confirmed:
+        raise HTTPException(409,"已有平台上传确认；请先取消全部平台确认，再取消版本锁定")
+    stamp=db.now()
+    db.execute("UPDATE exports SET status='review_ready',locked=0,approved_at=NULL WHERE id=?",(export_id,))
+    db.execute("UPDATE projects SET status=CASE WHEN status='published' THEN 'review_ready' ELSE status END,updated_at=? WHERE id=?",(stamp,export["project_id"]))
+    db.log_event(export["project_id"],"warning","人工审核","export_unlocked",f"{export['version']} 已取消批准锁定；现有成片继续保留",{"export_id":export_id,"version":export["version"],"format":export["format"]})
+    return {"ok":True,"id":export_id,"version":export["version"],"status":"review_ready","locked":False}
 
 @app.post("/api/exports/{export_id}/release-scheduled")
 def release_scheduled_export(export_id:int):

@@ -74,20 +74,25 @@ def create_manual_revision(project_id,source_export_id,cut_intervals,end_at,priv
     db.log_event(project_id,"success","成片人工修订","manual_revision_created",f"已根据实际成片时间码创建 {version} 长篇修订任务",{"source_export_id":source_export_id,"new_export_id":export_id,"cut_seconds":round(old_duration-new_duration,3),"new_duration":round(new_duration,3),"privacy_suppress_rules":len(shifted_rules.get('suppress',[])),"privacy_force_rules":len(shifted_rules.get('force_cover',[])),"privacy_owner_rules":len(shifted_rules.get('force_owner',[])),"text_overlays":len(shifted_overlays),"source_actual_duration":source_actual_duration})
     return {"export_id":export_id,"version":version,"status":"render_requested","old_duration":round(old_duration,3),"new_duration":round(new_duration,3),"privacy_rules":shifted_rules,"text_overlays":shifted_overlays,"mapped_cut_intervals":cut_intervals,"mapped_end_at":end_at}
 
-def create_short_privacy_revision(project_id,source_export_id,privacy_rules,instruction_text,output_names=None):
+def create_privacy_revision(project_id,source_export_id,privacy_rules,instruction_text,output_names=None,revision_ids=None):
     db.init_db();source=db.row("SELECT * FROM exports WHERE id=? AND project_id=?",(source_export_id,project_id))
-    if not source:raise ValueError("找不到源短篇版本")
-    if source["format"]!="short_9x16":raise ValueError("来源版本不是短篇")
+    if not source:raise ValueError("找不到来源版本")
     try:snapshot=json.loads(source.get("timeline_snapshot") or "{}")
     except json.JSONDecodeError:snapshot={}
-    if not snapshot or not all(isinstance(value,list) and value for value in snapshot.values()):raise ValueError("源短篇没有可复用的独立时间线")
+    if not snapshot or not all(isinstance(value,list) and value for value in snapshot.values()):raise ValueError("来源版本没有可复用的独立时间线")
     if output_names:
         requested={str(value) for value in output_names};snapshot={name:timeline for name,timeline in snapshot.items() if name in requested}
-        if not snapshot:raise ValueError("指定保留的短篇不在源版本中")
+        if not snapshot:raise ValueError("指定保留的成片不在来源版本中")
     versions=[int(value["version"][1:]) for value in db.rows("SELECT version FROM exports WHERE project_id=?",(project_id,)) if value["version"].startswith("v") and value["version"][1:].isdigit()];version=f"v{max(versions,default=0)+1}";stamp=db.now()
     try:options=json.loads(source.get("render_options") or "{}")
     except json.JSONDecodeError:options={}
-    options.pop("queue_after_export_id",None);options["privacy_rules"]=privacy_rules;options["kept_outputs"]=list(snapshot);options["manual_revision"]={"source_export_id":source_export_id,"source_version":source["version"],"time_basis":"short_output","instruction":instruction_text}
-    export_id=db.execute("INSERT INTO exports(project_id,version,format,status,timeline_snapshot,caption_overrides,render_options,source_export_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(project_id,version,source["format"],"render_requested",json.dumps(snapshot,ensure_ascii=False),source.get("caption_overrides") or "{}",json.dumps(options,ensure_ascii=False),source_export_id,stamp))
-    db.execute("INSERT INTO revisions(project_id,kind,body,status,created_at,resolved_at) VALUES(?,?,?,?,?,?)",(project_id,"short_privacy",instruction_text,"resolved",stamp,stamp));db.execute("UPDATE projects SET status='render_requested',error=NULL,updated_at=? WHERE id=?",(stamp,project_id));pending=[value["version"] for value in db.rows("SELECT version FROM exports WHERE project_id=? AND status='render_requested' ORDER BY id",(project_id,))];db.create_control(project_id,"stopped","render_requested","成片人工修订","、".join(pending)+" 等待启动");db.log_event(project_id,"success","短篇人工修订","short_privacy_revision_created",f"已创建 {version} 单条短篇隐私修订任务；首镜头本人不遮挡",{"source_export_id":source_export_id,"new_export_id":export_id,"outputs":list(snapshot),"privacy_suppress_rules":len(privacy_rules.get('suppress',[])),"privacy_force_rules":len(privacy_rules.get('force_cover',[]))})
-    return {"export_id":export_id,"version":version,"status":"render_requested","outputs":list(snapshot),"privacy_rules":privacy_rules}
+    options.pop("queue_after_export_id",None);options["privacy_rules"]=privacy_rules;options["kept_outputs"]=list(snapshot);options["manual_revision"]={"source_export_id":source_export_id,"source_version":source["version"],"time_basis":"rendered_output","instruction":instruction_text,"kind":"privacy_only"}
+    export_id=db.execute("INSERT INTO exports(project_id,version,format,status,timeline_snapshot,caption_overrides,render_options,source_export_id,render_mode,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(project_id,version,source["format"],"render_requested",json.dumps(snapshot,ensure_ascii=False),source.get("caption_overrides") or "{}",json.dumps(options,ensure_ascii=False),source_export_id,"privacy_only",stamp))
+    applied_ids=[]
+    for revision_id in revision_ids or []:
+        db.execute("UPDATE revisions SET status='applied',applied_export_id=?,applied_version=?,resolved_at=? WHERE id=? AND project_id=? AND status='open'",(export_id,version,stamp,int(revision_id),project_id));applied_ids.append(int(revision_id))
+    if not revision_ids:
+        db.execute("INSERT INTO revisions(project_id,kind,body,status,source_export_id,source_version,applied_export_id,applied_version,created_at,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(project_id,"privacy",instruction_text,"applied",source_export_id,source["version"],export_id,version,stamp,stamp))
+    db.execute("UPDATE projects SET status='render_requested',error=NULL,updated_at=? WHERE id=?",(stamp,project_id));pending=[value["version"] for value in db.rows("SELECT version FROM exports WHERE project_id=? AND status='render_requested' ORDER BY id",(project_id,))];db.create_control(project_id,"stopped","render_requested","人工马赛克校对","、".join(pending)+" 等待启动",render_scope=source["format"])
+    db.log_event(project_id,"success","人工马赛克校对","privacy_revision_created",f"已基于 {source['version']} 创建 {version} 普通马赛克快速版；剪辑与字幕保持不变",{"source_export_id":source_export_id,"new_export_id":export_id,"outputs":list(snapshot),"privacy_force_rules":len(privacy_rules.get('force_cover',[])),"privacy_suppress_rules":len(privacy_rules.get('suppress',[])),"revision_ids":applied_ids})
+    return {"export_id":export_id,"version":version,"status":"render_requested","outputs":list(snapshot),"privacy_rules":privacy_rules,"revision_ids":applied_ids}

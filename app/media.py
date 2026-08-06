@@ -227,11 +227,13 @@ def _video_filter(fmt,item):
     if effect=="flash_frame":return base+",fade=t=in:st=0:d=0.06:color=white,eq=contrast=1.08:saturation=1.10"
     return base+",eq=contrast=1.025:saturation=1.06"
 
-def _music_mix_filter(fmt,target_seconds=None):
+def _music_mix_filter(fmt,target_seconds=None,mix_options=None):
+    mix_options=mix_options if isinstance(mix_options,dict) else {}
     if fmt=="short_9x16":
         if target_seconds is None:target_seconds=600.0
         target=max(0.25,float(target_seconds))
-        return f"[0:a]apad=whole_dur={target:.3f},asplit=2[base_mix][base_side];[1:a]atrim=duration={target:.3f},volume=0.26[bg];[bg][base_side]sidechaincompress=threshold=0.015:ratio=10:attack=15:release=280[ducked];[base_mix][ducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[a]"
+        bgm_volume=max(0.0,min(float(mix_options.get("bgm_volume") or 0.26),1.0))
+        return f"[0:a]apad=whole_dur={target:.3f},asplit=2[base_mix][base_side];[1:a]atrim=duration={target:.3f},volume={bgm_volume:.3f}[bg];[bg][base_side]sidechaincompress=threshold=0.015:ratio=10:attack=15:release=280[ducked];[base_mix][ducked]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,alimiter=limit=0.95[a]"
     return "[1:a]volume=0.08[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]"
 
 def _segment_audio_filter(item):
@@ -239,12 +241,20 @@ def _segment_audio_filter(item):
     dialogue_filter="highpass=f=80,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,volume=0.90"
     if item.get("background_cleanup"):
         dialogue_filter="highpass=f=95,lowpass=f=10500,afftdn=nf=-32,loudnorm=I=-16:TP=-1.5:LRA=9,volume=0.96"
-    return {
+    selected={
         "dialogue":dialogue_filter,
+        "denoise":"highpass=f=65,lowpass=f=12000,afftdn=nf=-27,loudnorm=I=-18:TP=-1.5:LRA=12,volume=0.82",
         "ambient":"highpass=f=45,loudnorm=I=-21:TP=-2:LRA=14,volume=0.55",
         "montage":"highpass=f=80,afftdn=nf=-25,loudnorm=I=-23:TP=-2:LRA=11,volume=0.18",
         "mute":"volume=0",
     }.get(audio_mode,"highpass=f=80,afftdn=nf=-25,loudnorm=I=-23:TP=-2:LRA=11,volume=0.18")
+    try:dialogue_start=max(0.0,float(item.get("dialogue_start_offset") or 0))
+    except (TypeError,ValueError):dialogue_start=0.0
+    if audio_mode=="dialogue" and dialogue_start>0:
+        try:fade=max(0.02,min(float(item.get("dialogue_fade_seconds") or 0.08),0.5))
+        except (TypeError,ValueError):fade=0.08
+        selected+=f",volume=0:enable='lt(t,{dialogue_start:.6f})',afade=t=in:st={dialogue_start:.6f}:d={fade:.3f}"
+    return selected
 
 def _concat_segments(segments,merged,temp,expected_duration=None):
     concat=temp/"concat.txt";concat.write_text("\n".join(f"file '{p.as_posix()}'" for p in segments),encoding="utf-8")
@@ -285,7 +295,7 @@ def _merge_short_segments(segments,used,merged,temp):
             (temp/"short-merge.ffmpeg.log").write_text(error.stderr or str(error),encoding="utf-8")
             _concat_segments(segments,merged,temp)
 
-def render_timeline(assets,timeline,fmt: str,target:Path,temp:Path,music_files=(),checkpoint=None,caption_overrides=None,output_name=None,burn_captions=True):
+def render_timeline(assets,timeline,fmt: str,target:Path,temp:Path,music_files=(),checkpoint=None,caption_overrides=None,output_name=None,burn_captions=True,mix_options=None):
     temp.mkdir(parents=True,exist_ok=True);target.parent.mkdir(parents=True,exist_ok=True)
     by_id={int(a['id']):a for a in assets};segments=[];used=[]
     for idx,item in enumerate(timeline):
@@ -315,7 +325,7 @@ def render_timeline(assets,timeline,fmt: str,target:Path,temp:Path,music_files=(
             mix_seconds=None
             if fmt=="short_9x16":
                 mix_seconds=min(float(probe(merged).get("duration") or 0),float(probe(music).get("duration") or 0))
-            inputs += ["-stream_loop","-1","-i",str(music),"-filter_complex",_music_mix_filter(fmt,mix_seconds),"-map","0:v","-map","[a]"]
+            inputs += ["-stream_loop","-1","-i",str(music),"-filter_complex",_music_mix_filter(fmt,mix_seconds,mix_options),"-map","0:v","-map","[a]"]
         if burn_captions and has_subtitles:inputs += ["-vf",f"subtitles=filename='{srt.as_posix()}':force_style='{_subtitle_style(fmt)}'"]
         nvenc=inputs+["-c:v","h264_nvenc","-preset","p4","-cq","23","-b:v","0","-c:a","aac","-b:a","192k","-shortest",str(target)]
         cpu=inputs+["-c:v","libx264","-preset","fast","-crf","23","-c:a","aac","-b:a","192k","-shortest",str(target)]
